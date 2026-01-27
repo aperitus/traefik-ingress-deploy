@@ -1,0 +1,57 @@
+# Traefik values template (minimal)
+#
+# Validate keys on your runner:
+#   helm show values traefik/traefik --version <ver> | less
+#
+# Notes:
+# - We keep the dashboard IngressRoute disabled; the workflow validates the dashboard/API via port-forward only.
+# - We create a non-default IngressClass called "traefik" so app repos can opt-in per Ingress.
+
+imagePullSecrets:
+  - name: "<IMAGE_PULL_SECRET_NAME>"
+
+image:
+  registry: "<REGISTRY_SERVER>"
+  repository: "<TRAEFIK_IMAGE_REPOSITORY>"   # e.g. traefik/traefik (in your Nexus path)
+  tag: "<TRAEFIK_IMAGE_TAG>"                 # optional; defaults to chart appVersion if empty
+
+ingressClass:
+  enabled: true
+  isDefaultClass: false
+  name: "traefik"
+
+providers:
+  kubernetesIngress:
+    enabled: true
+  kubernetesCRD:
+    enabled: true
+
+# Internal load balancer service on AKS (Azure ILB)
+service:
+  enabled: true
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    # Optional: pick a specific private IP for the ILB (must be free in the subnet)
+    # service.beta.kubernetes.io/azure-load-balancer-ipv4: "10.240.0.25"
+
+# EntryPoints: web(80), websecure(443), traefik(8080)
+ports:
+  web:
+    expose: true
+    exposedPort: 80
+  websecure:
+    expose: true
+    exposedPort: 443
+  traefik:
+    expose: false
+
+# Avoid any routed dashboard exposure; keep it internal-only.
+ingressRoute:
+  dashboard:
+    enabled: false
+
+# Force the watched ingress class names (important if you choose a non-default name).
+additionalArguments:
+  - "--providers.kubernetesingress.ingressclass=traefik"
+  - "--providers.kubernetescrd.ingressclass=traefik"

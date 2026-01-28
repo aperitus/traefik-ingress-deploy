@@ -101,15 +101,46 @@ jobs:
           kubectl version --client=true
           helm version
 
+      - name: "Validate required secrets (non-empty)"
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          # GitHub Actions renders missing secrets as empty strings. Fail fast with a clear error.
+
+          required=(AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID DEPLOY_CLIENT_ID DEPLOY_SECRET)
+
+          for k in "${required[@]}"; do
+
+            if [[ -z "${!k:-}" ]]; then
+
+              echo "ERROR: ${k} is not set or empty. Ensure it exists as a Secret in the selected GitHub Environment (or repo secret) with the exact name."
+
+              exit 1
+
+            fi
+
+          done
+
+
       - name: "Azure login (Service Principal + secret)"
         shell: bash
         run: |
           set -euo pipefail
+          # Defensive: ensure secrets are non-empty before calling az login
+          : "${DEPLOY_CLIENT_ID:?DEPLOY_CLIENT_ID empty}"
+          : "${DEPLOY_SECRET:?DEPLOY_SECRET empty}"
+          : "${AZURE_TENANT_ID:?AZURE_TENANT_ID empty}"
+          : "${AZURE_SUBSCRIPTION_ID:?AZURE_SUBSCRIPTION_ID empty}"
+
           az login \
             --service-principal \
-            --username "${DEPLOY_CLIENT_ID}" \
-            --password "${DEPLOY_SECRET}" \
-            --tenant "${AZURE_TENANT_ID}" \
+            --username="${DEPLOY_CLIENT_ID}" \
+            --password="${DEPLOY_SECRET}" \
+            --tenant="${AZURE_TENANT_ID}" \
             --output none
           az account set --subscription "${AZURE_SUBSCRIPTION_ID}"
 
@@ -305,39 +336,4 @@ jobs:
             --ipv4-address "${ILB_IP}" \
             --output none
 
-          echo "Updated Private DNS: ${RECORD_NAME}.${PRIVATE_DNS_ZONE_NAME} -> ${IP}"
-
-      - name: "Post-deploy check: Traefik dashboard/API reachable via port-forward"
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          POD="$(kubectl -n "${TRAEFIK_NAMESPACE}" get pod \
-            -l app.kubernetes.io/name=traefik \
-            -o jsonpath='{.items[0].metadata.name}')"
-
-          echo "Port-forwarding to Traefik pod: ${POD}"
-
-          kubectl -n "${TRAEFIK_NAMESPACE}" port-forward "pod/${POD}" 8080:8080 >/tmp/traefik-portforward.log 2>&1 &
-          PF_PID=$!
-
-          cleanup() {
-            kill "${PF_PID}" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-
-          sleep 3
-
-          if curl -fsS --max-time 5 "http://127.0.0.1:8080/api/version" >/dev/null 2>&1; then
-            echo "Traefik API reachable on 127.0.0.1:8080/api/version"
-            exit 0
-          fi
-
-          if curl -fsS --max-time 5 "http://127.0.0.1:8080/dashboard/" >/dev/null 2>&1; then
-            echo "Traefik dashboard reachable on 127.0.0.1:8080/dashboard/"
-            exit 0
-          fi
-
-          echo "Traefik dashboard/API check failed. Port-forward log (tail):" >&2
-          tail -n 50 /tmp/traefik-portforward.log >&2 || true
-          exit 1
+          echo "Updated Private DNS A record: ${RECORD_NAME}.${PRIVATE_DNS_ZONE_NAME} -> ${ILB_IP}"

@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: GitHub Environment to use (e.g., dev)
+        description: GitHub Environment to use
         required: true
-        type: string
+        type: choice
+        options:
+          - dev
+          - preprod
+          - prod
       aks_resource_group:
         description: AKS resource group (optional; defaults to vars.AKS_RESOURCE_GROUP)
         required: false

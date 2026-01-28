@@ -18,6 +18,8 @@ You are operating on the repository that owns the **cluster ingress baseline** d
 - Ingress class: `traefik` (non-default)
 - Internal-only ingress: Traefik Service type `LoadBalancer` using Azure **internal** load balancer annotations.
 - Optional DNS: if `DNS_ENABLED=true`, update Azure **Private DNS** `A` record (e.g., `ingress-traefik.logiki.co.uk`) to the ILB IP.
+  - If the Private DNS zone is in a different subscription, the workflow must `az account set` to `PRIVATE_DNS_ZONE_SUBSCRIPTION_ID` before record updates.
+  - The Service Principal must have **Private DNS Zone Contributor** (or equivalent custom role) on the zone or its resource group in that subscription.
 
 ## Required workflow behaviours
 - Idempotent: safe to rerun without manual cleanup.
@@ -35,3 +37,6 @@ You are operating on the repository that owns the **cluster ingress baseline** d
 - Use explicit, readable multi-line YAML blocks.
 - Avoid brittle assumptions; prefer parameterized inputs and documented defaults.
 - Never print secrets to logs.
+
+## GHES note
+- Use Azure CLI login and runner-installed `kubectl`/`helm` (no Marketplace actions). `actions/checkout@v3` is allowed.

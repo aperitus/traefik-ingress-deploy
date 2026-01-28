@@ -8,28 +8,30 @@ on:
         required: true
         type: string
       aks_resource_group:
-        description: AKS resource group
-        required: true
+        description: AKS resource group (optional; defaults to vars.AKS_RESOURCE_GROUP)
+        required: false
         type: string
+        default: ""
       aks_cluster_name:
-        description: AKS cluster name
-        required: true
+        description: AKS cluster name (optional; defaults to vars.AKS_CLUSTER_NAME)
+        required: false
         type: string
+        default: ""
       use_admin_credentials:
         description: Use AKS admin kubeconfig (adds --admin to az aks get-credentials)
         required: false
         type: boolean
         default: false
       traefik_chart_version:
-        description: Traefik chart version (pin)
-        required: true
+        description: Traefik chart version (optional; defaults to vars.TRAEFIK_CHART_VERSION)
+        required: false
         type: string
-        default: "38.0.1"
+        default: ""
       helm_timeout:
-        description: Helm timeout (e.g., 10m)
-        required: true
+        description: Helm timeout (optional; defaults to vars.HELM_TIMEOUT)
+        required: false
         type: string
-        default: "10m"
+        default: ""
 
 concurrency:
   group: traefik-ingress-deploy
@@ -49,8 +51,14 @@ jobs:
       TRAEFIK_NAMESPACE: traefik
       TRAEFIK_RELEASE: traefik
 
-      # If you proxy charts via Nexus, set this to your Nexus Helm repo URL.
-      TRAEFIK_HELM_REPO_URL: "https://traefik.github.io/charts"
+      # Repo/Environment variables (non-secret defaults)
+      AKS_RESOURCE_GROUP: ${{ inputs.aks_resource_group || vars.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ inputs.aks_cluster_name || vars.AKS_CLUSTER_NAME }}
+      TRAEFIK_CHART_VERSION: ${{ inputs.traefik_chart_version || vars.TRAEFIK_CHART_VERSION }}
+      HELM_TIMEOUT: ${{ inputs.helm_timeout || vars.HELM_TIMEOUT }}
+
+      # Helm chart repo (optional override; defaults to upstream)
+      TRAEFIK_HELM_REPO_URL: ${{ vars.TRAEFIK_HELM_REPO_URL || 'https://traefik.github.io/charts' }}
 
       # Azure SP auth (GHES is firewalled; do not use OIDC federation)
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -64,43 +72,60 @@ jobs:
       REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
       IMAGE_PULL_SECRET_NAME: ${{ secrets.IMAGE_PULL_SECRET_NAME }}
 
-      # Traefik image override (non-secret; keep in env for easy override)
-      TRAEFIK_IMAGE_REPOSITORY: "traefik/traefik"
-      TRAEFIK_IMAGE_TAG: ""  # optional; if empty chart uses appVersion
+      # Traefik image override (non-secret; set to your Nexus repo path if required)
+      TRAEFIK_IMAGE_REPOSITORY: ${{ vars.TRAEFIK_IMAGE_REPOSITORY || 'traefik/traefik' }}
+      TRAEFIK_IMAGE_TAG: ${{ vars.TRAEFIK_IMAGE_TAG || '' }}
 
-      # Optional DNS update (Azure Private DNS)
+      # Optional: pin a specific ILB IP (must be free in subnet). If unset, Azure assigns.
+      TRAEFIK_LB_IPV4: ${{ vars.TRAEFIK_LB_IPV4 || '' }}
+
+      # Optional DNS update (Azure Private DNS) - values from vars preferred, secrets allowed for backward compatibility
       DNS_ENABLED: ${{ secrets.DNS_ENABLED }}
-      PRIVATE_DNS_ZONE_RESOURCE_GROUP: ${{ secrets.PRIVATE_DNS_ZONE_RESOURCE_GROUP }}
-      PRIVATE_DNS_ZONE_NAME: ${{ secrets.PRIVATE_DNS_ZONE_NAME }}
-      PRIVATE_DNS_A_RECORD_NAME: ${{ secrets.PRIVATE_DNS_A_RECORD_NAME }}
-
-      # Optional: pin a specific ILB IP by setting this (must be free in subnet)
-      # (If empty, AKS assigns an IP; DNS update handles stability at the name level.)
-      TRAEFIK_LB_IPV4: ""
+      PRIVATE_DNS_ZONE_SUBSCRIPTION_ID: ${{ vars.PRIVATE_DNS_ZONE_SUBSCRIPTION_ID || secrets.PRIVATE_DNS_ZONE_SUBSCRIPTION_ID }}
+      PRIVATE_DNS_ZONE_RESOURCE_GROUP: ${{ vars.PRIVATE_DNS_ZONE_RESOURCE_GROUP || secrets.PRIVATE_DNS_ZONE_RESOURCE_GROUP }}
+      PRIVATE_DNS_ZONE_NAME: ${{ vars.PRIVATE_DNS_ZONE_NAME || secrets.PRIVATE_DNS_ZONE_NAME }}
+      PRIVATE_DNS_A_RECORD_NAME: ${{ vars.PRIVATE_DNS_A_RECORD_NAME || secrets.PRIVATE_DNS_A_RECORD_NAME }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v4
+      - name: "Verify toolchain on runner"
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v az >/dev/null
+          command -v kubectl >/dev/null
+          command -v helm >/dev/null
+          az version
+          kubectl version --client=true
+          helm version
 
-      - name: Setup Helm
-        uses: azure/setup-helm@v4
+      - name: "Azure login (Service Principal + secret)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          az login \
+            --service-principal \
+            --username "${DEPLOY_CLIENT_ID}" \
+            --password "${DEPLOY_SECRET}" \
+            --tenant "${AZURE_TENANT_ID}" \
+            --output none
+          az account set --subscription "${AZURE_SUBSCRIPTION_ID}"
 
-      - name: Azure login (Service Principal + secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ env.DEPLOY_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
-          client-secret: ${{ env.DEPLOY_SECRET }}
+      - name: "Validate required variables"
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${AKS_RESOURCE_GROUP:?Set inputs.aks_resource_group or vars.AKS_RESOURCE_GROUP}"
+          : "${AKS_CLUSTER_NAME:?Set inputs.aks_cluster_name or vars.AKS_CLUSTER_NAME}"
+          : "${TRAEFIK_CHART_VERSION:?Set inputs.traefik_chart_version or vars.TRAEFIK_CHART_VERSION}"
+          : "${HELM_TIMEOUT:?Set inputs.helm_timeout or vars.HELM_TIMEOUT}"
 
       - name: Get AKS credentials
         shell: bash
         run: |
           set -euo pipefail
-          az account set --subscription "${AZURE_SUBSCRIPTION_ID}"
 
           ADMIN_FLAG=""
           if [[ "${{ inputs.use_admin_credentials }}" == "true" ]]; then
@@ -108,12 +133,10 @@ jobs:
           fi
 
           az aks get-credentials \
-            --resource-group "${{ inputs.aks_resource_group }}" \
-            --name "${{ inputs.aks_cluster_name }}" \
+            --resource-group "${AKS_RESOURCE_GROUP}" \
+            --name "${AKS_CLUSTER_NAME}" \
             ${ADMIN_FLAG} \
             --overwrite-existing
-
-          kubectl version --client=true
 
       - name: Ensure Traefik namespace
         shell: bash
@@ -127,107 +150,34 @@ jobs:
           set -euo pipefail
           umask 077
 
-          python3 - <<'PY'
-          import os, json, base64
-          server = os.environ["REGISTRY_SERVER"]
-          user = os.environ["REGISTRY_USERNAME"]
-          pw = os.environ["REGISTRY_PASSWORD"]
-
-          cfg = {
-            "auths": {
-              server: {
-                "username": user,
-                "password": pw,
-                "auth": base64.b64encode(f"{user}:{pw}".encode()).decode(),
-              }
-            }
-          }
-          open("dockerconfigjson","w",encoding="utf-8").write(json.dumps(cfg))
-          PY
-
-          kubectl -n "${TRAEFIK_NAMESPACE}" create secret generic "${IMAGE_PULL_SECRET_NAME}" \
-            --type="kubernetes.io/dockerconfigjson" \
-            --from-file=".dockerconfigjson=dockerconfigjson" \
+          kubectl -n "${TRAEFIK_NAMESPACE}" create secret docker-registry "${IMAGE_PULL_SECRET_NAME}" \
+            --docker-server="${REGISTRY_SERVER}" \
+            --docker-username="${REGISTRY_USERNAME}" \
+            --docker-password="${REGISTRY_PASSWORD}" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-          rm -f dockerconfigjson
-
-      - name: Render Helm values (no secrets printed)
+      - name: Render Helm values (no secret material printed)
         shell: bash
         run: |
           set -euo pipefail
           umask 077
 
           python3 - <<'PY'
-          import os
-
-          def y(s: str) -> str:
-            if s is None:
-              return '""'
-            s = str(s)
-            s = s.replace('\\\\', '\\\\\\\\').replace('"', '\\"')
-            return f'"{s}"'
-
-          image_pull_secret = os.environ["IMAGE_PULL_SECRET_NAME"]
-          registry = os.environ["REGISTRY_SERVER"]
-          repo = os.environ.get("TRAEFIK_IMAGE_REPOSITORY", "traefik/traefik")
-          tag = os.environ.get("TRAEFIK_IMAGE_TAG", "")
-          lb_ip = os.environ.get("TRAEFIK_LB_IPV4", "")
-
-          lines = []
-          lines.append("imagePullSecrets:")
-          lines.append(f"  - name: {y(image_pull_secret)}")
-          lines.append("")
-          lines.append("image:")
-          lines.append(f"  registry: {y(registry)}")
-          lines.append(f"  repository: {y(repo)}")
-          if tag.strip():
-            lines.append(f"  tag: {y(tag.strip())}")
-          lines.append("")
-          lines.append("ingressClass:")
-          lines.append("  enabled: true")
-          lines.append("  isDefaultClass: false")
-          lines.append("  name: \"traefik\"")
-          lines.append("")
-          lines.append("providers:")
-          lines.append("  kubernetesIngress:")
-          lines.append("    enabled: true")
-          lines.append("  kubernetesCRD:")
-          lines.append("    enabled: true")
-          lines.append("")
-          lines.append("service:")
-          lines.append("  enabled: true")
-          lines.append("  type: LoadBalancer")
-          lines.append("  annotations:")
-          lines.append("    service.beta.kubernetes.io/azure-load-balancer-internal: \"true\"")
-          if lb_ip.strip():
-            lines.append(f"    service.beta.kubernetes.io/azure-load-balancer-ipv4: {y(lb_ip.strip())}")
-          lines.append("")
-          lines.append("ports:")
-          lines.append("  web:")
-          lines.append("    expose: true")
-          lines.append("    exposedPort: 80")
-          lines.append("  websecure:")
-          lines.append("    expose: true")
-          lines.append("    exposedPort: 443")
-          lines.append("  traefik:")
-          lines.append("    expose: false")
-          lines.append("")
-          lines.append("ingressRoute:")
-          lines.append("  dashboard:")
-          lines.append("    enabled: false")
-          lines.append("")
-          lines.append("additionalArguments:")
-          lines.append("  - \"--providers.kubernetesingress.ingressclass=traefik\"")
-          lines.append("  - \"--providers.kubernetescrd.ingressclass=traefik\"")
-          lines.append("")
-
-          out = "/tmp/values.traefik.generated.yaml"
-          with open(out, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-
-          os.chmod(out, 0o600)
+          import os, pathlib
+          tpl = pathlib.Path('helm/traefik/values.template.yaml').read_text(encoding='utf-8')
+          repl = {
+            '<IMAGE_PULL_SECRET_NAME>': os.environ['IMAGE_PULL_SECRET_NAME'],
+            '<REGISTRY_SERVER>': os.environ['REGISTRY_SERVER'],
+            '<TRAEFIK_IMAGE_REPOSITORY>': os.environ['TRAEFIK_IMAGE_REPOSITORY'],
+            '<TRAEFIK_IMAGE_TAG>': os.environ.get('TRAEFIK_IMAGE_TAG',''),
+          }
+          for k,v in repl.items():
+            tpl = tpl.replace(k, v)
+          out = pathlib.Path('/tmp/values.traefik.generated.yaml')
+          out.write_text(tpl, encoding='utf-8')
           PY
+
+          chmod 600 /tmp/values.traefik.generated.yaml
 
       - name: Install/upgrade Traefik (official chart; images pulled from Nexus)
         shell: bash
@@ -239,30 +189,71 @@ jobs:
 
           helm upgrade --install "${TRAEFIK_RELEASE}" traefik/traefik \
             --namespace "${TRAEFIK_NAMESPACE}" \
-            --version "${{ inputs.traefik_chart_version }}" \
+            --version "${TRAEFIK_CHART_VERSION}" \
             --values /tmp/values.traefik.generated.yaml \
-            --wait --atomic --timeout "${{ inputs.helm_timeout }}"
+            --wait --atomic --timeout "${HELM_TIMEOUT}"
 
           kubectl -n "${TRAEFIK_NAMESPACE}" get pods -o wide
+          kubectl -n "${TRAEFIK_NAMESPACE}" get svc "${TRAEFIK_RELEASE}" -o wide
 
-      - name: Wait for internal LoadBalancer IP
+      - name: Post-deployment checks (internal readiness + ILB IP)
         shell: bash
         run: |
           set -euo pipefail
 
-          SVC="${TRAEFIK_RELEASE}"
-          for i in {1..60}; do
-            IP="$(kubectl -n "${TRAEFIK_NAMESPACE}" get svc "${SVC}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
-            if [[ -n "${IP}" ]]; then
-              echo "Traefik internal LB IP: ${IP}"
-              echo "TRAEFIK_LB_IP=${IP}" >> "${GITHUB_ENV}"
-              exit 0
-            fi
-            sleep 5
-          done
+          kubectl -n "${TRAEFIK_NAMESPACE}" rollout status deploy/"${TRAEFIK_RELEASE}" --timeout=5m
 
-          echo "Timed out waiting for Traefik LoadBalancer IP." >&2
-          kubectl -n "${TRAEFIK_NAMESPACE}" get svc "${SVC}" -o yaml >&2 || true
+          ILB_IP="$(kubectl -n "${TRAEFIK_NAMESPACE}" get svc "${TRAEFIK_RELEASE}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+          if [[ -z "${ILB_IP}" ]]; then
+            echo "ERROR: Traefik service has no ILB IP yet."
+            kubectl -n "${TRAEFIK_NAMESPACE}" get svc "${TRAEFIK_RELEASE}" -o yaml
+            exit 1
+          fi
+          echo "Traefik ILB IP: ${ILB_IP}"
+
+      - name: Post-deployment checks (dashboard/API via port-forward)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Best-effort connectivity test only (dashboard is not exposed via IngressRoute).
+          # We accept any HTTP status except 000 (connection failure).
+
+          try_port_forward() {
+            local target_port="$1"
+            local local_port="19000"
+
+            kubectl -n "${TRAEFIK_NAMESPACE}" port-forward deploy/"${TRAEFIK_RELEASE}" "${local_port}:${target_port}" >/tmp/portforward.log 2>&1 &
+            local pf_pid=$!
+
+            # Wait briefly for port-forward to come up
+            sleep 2
+
+            # If port-forward died immediately, this port is not valid
+            if ! kill -0 "${pf_pid}" 2>/dev/null; then
+              return 1
+            fi
+
+            local code
+            code="$(curl -sS -o /dev/null -w %{http_code} http://127.0.0.1:${local_port}/ || true)"
+
+            kill "${pf_pid}" >/dev/null 2>&1 || true
+            wait "${pf_pid}" >/dev/null 2>&1 || true
+
+            if [[ "${code}" != "000" ]]; then
+              echo "Traefik port-forward OK on ${target_port} (HTTP ${code})"
+              return 0
+            fi
+
+            return 1
+          }
+
+          if try_port_forward 9000; then exit 0; fi
+          if try_port_forward 8080; then exit 0; fi
+
+          echo "ERROR: Traefik dashboard/API port-forward failed on 9000 and 8080."
+          echo "port-forward logs:"
+          cat /tmp/portforward.log || true
           exit 1
 
       - name: "Optional: Update Azure Private DNS A record (ingress-traefik -> ILB IP)"
@@ -271,24 +262,48 @@ jobs:
         run: |
           set -euo pipefail
 
+          : "${PRIVATE_DNS_ZONE_SUBSCRIPTION_ID:?PRIVATE_DNS_ZONE_SUBSCRIPTION_ID missing}"
           : "${PRIVATE_DNS_ZONE_RESOURCE_GROUP:?PRIVATE_DNS_ZONE_RESOURCE_GROUP missing}"
           : "${PRIVATE_DNS_ZONE_NAME:?PRIVATE_DNS_ZONE_NAME missing}"
 
           RECORD_NAME="${PRIVATE_DNS_A_RECORD_NAME:-ingress-traefik}"
-          IP="${TRAEFIK_LB_IP:?TRAEFIK_LB_IP missing}"
+          ILB_IP="$(kubectl -n "${TRAEFIK_NAMESPACE}" get svc "${TRAEFIK_RELEASE}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+          : "${ILB_IP:?Failed to read ILB IP from service}"
 
-          # Replace recordset for idempotency (avoids stale IPs accumulating)
-          az network private-dns record-set a delete \
+          # DNS zone may live in a different subscription to the AKS cluster.
+          az account set --subscription "${PRIVATE_DNS_ZONE_SUBSCRIPTION_ID}"
+
+          az network private-dns record-set a create \
             -g "${PRIVATE_DNS_ZONE_RESOURCE_GROUP}" \
             -z "${PRIVATE_DNS_ZONE_NAME}" \
             -n "${RECORD_NAME}" \
-            --yes || true
+            --ttl 60 \
+            --output none
+
+          EXISTING="$(az network private-dns record-set a show \
+            -g "${PRIVATE_DNS_ZONE_RESOURCE_GROUP}" \
+            -z "${PRIVATE_DNS_ZONE_NAME}" \
+            -n "${RECORD_NAME}" \
+            --query "arecords[].ipv4Address" -o tsv || true)"
+
+          if [[ -n "${EXISTING}" ]]; then
+            while read -r ip; do
+              [[ -z "${ip}" ]] && continue
+              az network private-dns record-set a remove-record \
+                -g "${PRIVATE_DNS_ZONE_RESOURCE_GROUP}" \
+                -z "${PRIVATE_DNS_ZONE_NAME}" \
+                -n "${RECORD_NAME}" \
+                --ipv4-address "${ip}" \
+                --output none || true
+            done <<< "${EXISTING}"
+          fi
 
           az network private-dns record-set a add-record \
             -g "${PRIVATE_DNS_ZONE_RESOURCE_GROUP}" \
             -z "${PRIVATE_DNS_ZONE_NAME}" \
             -n "${RECORD_NAME}" \
-            -a "${IP}"
+            --ipv4-address "${ILB_IP}" \
+            --output none
 
           echo "Updated Private DNS: ${RECORD_NAME}.${PRIVATE_DNS_ZONE_NAME} -> ${IP}"
 

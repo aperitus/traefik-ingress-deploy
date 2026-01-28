@@ -265,7 +265,7 @@ jobs:
           kubectl -n "${TRAEFIK_NAMESPACE}" get svc "${SVC}" -o yaml >&2 || true
           exit 1
 
-      - name: Optional: Update Azure Private DNS A record (ingress-traefik -> ILB IP)
+      - name: "Optional: Update Azure Private DNS A record (ingress-traefik -> ILB IP)"
         if: ${{ env.DNS_ENABLED == 'true' }}
         shell: bash
         run: |
@@ -292,7 +292,7 @@ jobs:
 
           echo "Updated Private DNS: ${RECORD_NAME}.${PRIVATE_DNS_ZONE_NAME} -> ${IP}"
 
-      - name: Post-deploy check: Traefik dashboard/API reachable via port-forward
+      - name: "Post-deploy check: Traefik dashboard/API reachable via port-forward"
         shell: bash
         run: |
           set -euo pipefail

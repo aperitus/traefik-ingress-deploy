@@ -70,9 +70,28 @@ Network reachability from runner to:
 | Secret | Required | Description |
 |---|---:|---|
 | `DNS_ENABLED` | No | Set to `true` to update private DNS records |
+| `PRIVATE_DNS_ZONE_SUBSCRIPTION_ID` | No | Subscription ID that contains the private DNS zone (required when DNS_ENABLED=true and zone is in a different subscription) |
 | `PRIVATE_DNS_ZONE_RESOURCE_GROUP` | No | RG containing the private DNS zone |
 | `PRIVATE_DNS_ZONE_NAME` | No | Private DNS zone name (e.g., `logiki.co.uk`) |
 | `PRIVATE_DNS_A_RECORD_NAME` | No | Record set name to update (default: `ingress-traefik`) |
+
+---
+
+## 4.1 Azure role requirements for Private DNS update
+If `DNS_ENABLED=true` and you update a Private DNS record-set from this workflow, the deployment Service Principal must have RBAC in the **DNS zone subscription** (which may differ from the AKS subscription).
+
+**Minimum recommended role** (built-in):
+- **Private DNS Zone Contributor** on the scope of either:
+  - the Private DNS Zone resource, or
+  - the Resource Group containing the zone
+
+**Example scope (zone-level)**:
+`/subscriptions/<dns-subscription-id>/resourceGroups/<dns-rg>/providers/Microsoft.Network/privateDnsZones/<zone-name>`
+
+**Required GitHub Environment secret**:
+- `PRIVATE_DNS_ZONE_SUBSCRIPTION_ID` (DNS subscription)
+
+
 
 ---
 
@@ -92,9 +111,8 @@ Network reachability from runner to:
 Required checks in workflow:
 - `kubectl rollout status` for Traefik deployment.
 - Wait for `Service` `.status.loadBalancer.ingress[0].ip`.
-- Port-forward to Traefik pod port `8080` and verify one of:
-  - `GET /api/version` returns HTTP 200; or
-  - `GET /dashboard/` returns HTTP 200
+- Best-effort port-forward check to Traefik deployment (tries ports 9000 then 8080).
+  - Any HTTP status other than `000` (connection failure) is considered a successful reachability check.
 
 ---
 
@@ -103,3 +121,23 @@ Required checks in workflow:
 - Minimal values template: `helm/traefik/values.template.yaml`
 - This BOM: `docs/traefik-ingress-aks-gha-requirements-bom.md`
 - Project prompt: `docs/traefik-ingress-project-prompt.md`
+
+## Repository variables (vars)
+Set these as GitHub **Repository Variables** (or Environment Variables if you scope by environment):
+- `AKS_RESOURCE_GROUP`
+- `AKS_CLUSTER_NAME`
+- `TRAEFIK_CHART_VERSION`
+- `HELM_TIMEOUT`
+- Optional:
+  - `TRAEFIK_HELM_REPO_URL`
+  - `TRAEFIK_IMAGE_REPOSITORY`, `TRAEFIK_IMAGE_TAG`
+  - `TRAEFIK_LB_IPV4`
+  - DNS vars: `PRIVATE_DNS_ZONE_SUBSCRIPTION_ID`, `PRIVATE_DNS_ZONE_RESOURCE_GROUP`, `PRIVATE_DNS_ZONE_NAME`, `PRIVATE_DNS_A_RECORD_NAME`
+
+## GHES runner prerequisites
+The self-hosted runner must have:
+- Azure CLI (`az`)
+- `kubectl`
+- `helm`
+
+This workflow intentionally avoids GitHub.com Marketplace actions (except `actions/checkout@v3`).

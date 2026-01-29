@@ -127,7 +127,7 @@ Set these as GitHub **Repository Variables** (or Environment Variables if you sc
 - `AKS_RESOURCE_GROUP`
 - `AKS_CLUSTER_NAME`
 - `TRAEFIK_CHART_VERSION`
-- `HELM_TIMEOUT`
+- `HELM_TIMEOUT (Go duration, e.g., 10m / 600s / 1h30m)`
 - Optional:
   - `TRAEFIK_HELM_REPO_URL`
   - `TRAEFIK_IMAGE_REPOSITORY`, `TRAEFIK_IMAGE_TAG`

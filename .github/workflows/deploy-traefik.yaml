@@ -158,6 +158,20 @@ jobs:
           : "${AKS_CLUSTER_NAME:?Set inputs.aks_cluster_name or vars.AKS_CLUSTER_NAME}"
           : "${TRAEFIK_CHART_VERSION:?Set inputs.traefik_chart_version or vars.TRAEFIK_CHART_VERSION}"
           : "${HELM_TIMEOUT:?Set inputs.helm_timeout or vars.HELM_TIMEOUT}"
+          # Normalize HELM_TIMEOUT:
+          # - Helm expects a Go duration (e.g., 10m, 600s, 1h). A bare integer like "10" is invalid.
+          # - For convenience, if HELM_TIMEOUT is digits-only, treat it as minutes.
+          if [[ "${HELM_TIMEOUT}" =~ ^[0-9]+$ ]]; then
+            HELM_TIMEOUT="${HELM_TIMEOUT}m"
+          fi
+
+          # Basic format guard (digits + unit), allow composite Go durations as well (e.g., 1h30m).
+          if ! [[ "${HELM_TIMEOUT}" =~ ^[0-9]+[smhd]([0-9]+[smhd])*$ ]]; then
+            echo "ERROR: HELM_TIMEOUT must be a Go duration like '10m', '600s', '1h30m'. Got: '${HELM_TIMEOUT}'"
+            exit 1
+          fi
+
+          echo "HELM_TIMEOUT=${HELM_TIMEOUT}" >> "${GITHUB_ENV}"
 
       - name: Get AKS credentials
         shell: bash

@@ -1,4 +1,4 @@
-# Traefik values template (minimal)
+# Traefik values template (minimal, schema-compliant)
 #
 # Validate keys on your runner:
 #   helm show values traefik/traefik --version <ver> | less
@@ -6,14 +6,16 @@
 # Notes:
 # - We keep the dashboard IngressRoute disabled; the workflow validates the dashboard/API via port-forward only.
 # - We create a non-default IngressClass called "traefik" so app repos can opt-in per Ingress.
+# - This template is rendered to /tmp/values.traefik.generated.yaml at runtime (no secret material).
 
-imagePullSecrets:
-  - name: "<IMAGE_PULL_SECRET_NAME>"
+deployment:
+  imagePullSecrets:
+    - name: "<IMAGE_PULL_SECRET_NAME>"
 
 image:
   registry: "<REGISTRY_SERVER>"
   repository: "<TRAEFIK_IMAGE_REPOSITORY>"   # e.g. traefik/traefik (in your Nexus path)
-  tag: "<TRAEFIK_IMAGE_TAG>"                 # optional; defaults to chart appVersion if empty
+  tag: "<TRAEFIK_IMAGE_TAG>"                 # optional; if empty, workflow removes this key (chart defaults apply)
 
 ingressClass:
   enabled: true
@@ -26,30 +28,37 @@ providers:
   kubernetesCRD:
     enabled: true
 
+# Dashboard enabled internally only; no IngressRoute exposure from this chart.
+api:
+  dashboard: true
+  ingressRoute:
+    dashboard:
+      enabled: false
+    healthcheck:
+      enabled: false
+
 # Internal load balancer service on AKS (Azure ILB)
 service:
   enabled: true
   type: LoadBalancer
   annotations:
     service.beta.kubernetes.io/azure-load-balancer-internal: "true"
-    # Optional: pick a specific private IP for the ILB (must be free in the subnet)
-    # service.beta.kubernetes.io/azure-load-balancer-ipv4: "10.240.0.25"
+  spec: {}
 
 # EntryPoints: web(80), websecure(443), traefik(8080)
+# Chart schema expects expose to be an object (not a boolean).
 ports:
   web:
-    expose: true
+    expose:
+      default: true
     exposedPort: 80
   websecure:
-    expose: true
+    expose:
+      default: true
     exposedPort: 443
   traefik:
-    expose: false
-
-# Avoid any routed dashboard exposure; keep it internal-only.
-ingressRoute:
-  dashboard:
-    enabled: false
+    expose:
+      default: false
 
 # Force the watched ingress class names (important if you choose a non-default name).
 additionalArguments:

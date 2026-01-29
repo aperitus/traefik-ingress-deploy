@@ -39,12 +39,13 @@ Network reachability from runner to:
 ## 3) Workflow inputs (non-secret)
 | Input | Required | Description |
 |---|---:|---|
-| `environment` | Yes | GitHub Environment name (e.g., `dev`) |
-| `aks_resource_group` | Yes | AKS resource group name |
-| `aks_cluster_name` | Yes | AKS cluster name |
-| `use_admin_credentials` | No | Uses `az aks get-credentials --admin` |
-| `traefik_chart_version` | Yes | Pinned Traefik chart version |
-| `helm_timeout` | Yes | Helm timeout (e.g., `10m`) |
+| `environment` | Yes | GitHub Environment name (`dev`, `preprod`, `prod`) |
+| `aks_resource_group` | No | AKS resource group (defaults to `vars.AKS_RESOURCE_GROUP`) |
+| `aks_cluster_name` | No | AKS cluster name (defaults to `vars.AKS_CLUSTER_NAME`) |
+| `use_admin_credentials` | No | Uses `az aks get-credentials --admin` (bypasses Entra auth). Prefer `false` unless required. |
+| `traefik_chart_version` | No | Traefik chart version (defaults to `vars.TRAEFIK_CHART_VERSION`) |
+| `helm_timeout` | No | Helm timeout as a Go duration (defaults to `vars.HELM_TIMEOUT`). Digits-only inputs are treated as minutes (e.g., `10` → `10m`). |
+| `debug_values` | No | If `true`, uploads the rendered `/tmp/values.traefik.generated.yaml` as a workflow artifact **before** Helm install/upgrade. |
 
 ---
 
@@ -101,8 +102,9 @@ If `DNS_ENABLED=true` and you update a Private DNS record-set from this workflow
 - `helm upgrade --install` Traefik with:
   - `Service` type `LoadBalancer` and ILB annotations
   - IngressClass name `traefik` (non-default)
+  - EntryPoint exposure uses `ports.<entrypoint>.expose.default` objects (chart schema; booleans are rejected)
   - images overridden to Nexus
-  - `imagePullSecrets` set
+  - `deployment.imagePullSecrets` set (chart schema requires this path)
   - `--wait --atomic --timeout` and pinned chart version
 
 ---
@@ -110,6 +112,7 @@ If `DNS_ENABLED=true` and you update a Private DNS record-set from this workflow
 ## 6) Post-deployment checks
 Required checks in workflow:
 - `kubectl rollout status` for Traefik deployment.
+- If troubleshooting, re-run with `debug_values: true` to capture the rendered Helm values as an artifact.
 - Wait for `Service` `.status.loadBalancer.ingress[0].ip`.
 - Best-effort port-forward check to Traefik deployment (tries ports 9000 then 8080).
   - Any HTTP status other than `000` (connection failure) is considered a successful reachability check.

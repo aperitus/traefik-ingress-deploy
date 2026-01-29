@@ -9,6 +9,9 @@ You are operating on the repository that owns the **cluster ingress baseline** d
   - `DEPLOY_SECRET` (SP secret)
 - Secrets are sourced from GitHub **Environment secrets** (not repo-level secrets).
 - Nexus-only images:
+- Workflow must support a `debug_values` input (boolean, default false) which uploads the rendered Helm values file as an artifact before running Helm (no secrets in the values file).
+- Traefik Helm chart schema is strict: use `deployment.imagePullSecrets` (not a top-level `imagePullSecrets`) and `ports.<entrypoint>.expose.default` objects (not booleans).
+
   - All Traefik images MUST be pulled from Nexus (override image registry/repository).
   - Create/update `IMAGE_PULL_SECRET_NAME` in namespace `traefik`.
 

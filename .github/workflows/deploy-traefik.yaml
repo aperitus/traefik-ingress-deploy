@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: ""
+      debug_values:
+        description: Upload rendered Helm values file as an artifact (troubleshooting)
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: traefik-ingress-deploy
@@ -204,7 +209,11 @@ jobs:
 
           # Secrets are passed via env vars; do not echo them.
 
-          kubelogin convert-kubeconfig                   -l spn                   --client-id "${DEPLOY_CLIENT_ID}"                   --client-secret "${DEPLOY_SECRET}"                   --tenant-id "${AZURE_TENANT_ID}"
+          kubelogin convert-kubeconfig \
+            -l spn \
+            --client-id "${DEPLOY_CLIENT_ID}" \
+            --client-secret "${DEPLOY_SECRET}" \
+            --tenant-id "${AZURE_TENANT_ID}"
 
       - name: "Preflight: Kubernetes API reachable"
 
@@ -257,21 +266,41 @@ jobs:
           umask 077
 
           python3 - <<'PY'
-          import os, pathlib
+          import os, pathlib, re
+
           tpl = pathlib.Path('helm/traefik/values.template.yaml').read_text(encoding='utf-8')
+
           repl = {
             '<IMAGE_PULL_SECRET_NAME>': os.environ['IMAGE_PULL_SECRET_NAME'],
             '<REGISTRY_SERVER>': os.environ['REGISTRY_SERVER'],
             '<TRAEFIK_IMAGE_REPOSITORY>': os.environ['TRAEFIK_IMAGE_REPOSITORY'],
             '<TRAEFIK_IMAGE_TAG>': os.environ.get('TRAEFIK_IMAGE_TAG',''),
           }
-          for k,v in repl.items():
+          for k, v in repl.items():
             tpl = tpl.replace(k, v)
+
+          # If image tag is empty, remove the tag line entirely so chart defaults apply.
+          if not os.environ.get('TRAEFIK_IMAGE_TAG'):
+            tpl = re.sub(r'^\s*tag:\s*""\s*#.*\n', '', tpl, flags=re.M)
+
+          # Optional: pin a specific ILB IP. If set, replace the empty service spec.
+          lb_ip = os.environ.get('TRAEFIK_LB_IPV4', '').strip()
+          if lb_ip:
+            tpl = tpl.replace('  spec: {}', f'  spec:\n    loadBalancerIP: "{lb_ip}"')
+
           out = pathlib.Path('/tmp/values.traefik.generated.yaml')
           out.write_text(tpl, encoding='utf-8')
           PY
 
           chmod 600 /tmp/values.traefik.generated.yaml
+      - name: Upload rendered values (debug)
+        if: ${{ inputs.debug_values == true }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: values.traefik.generated
+          path: /tmp/values.traefik.generated.yaml
+
+
 
       - name: Install/upgrade Traefik (official chart; images pulled from Nexus)
         shell: bash

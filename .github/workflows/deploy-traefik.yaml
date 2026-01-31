@@ -40,6 +40,12 @@ on:
         type: boolean
         default: true
 
+      debug_tls_artifacts:
+        description: "DEBUG: Upload TLS certificate diagnostics as workflow artifacts (certificate only; never uploads private key)."
+        required: false
+        type: boolean
+        default: false
+
       aks_resource_group:
         description: AKS resource group (optional; defaults to vars.AKS_RESOURCE_GROUP)
         required: false
@@ -156,6 +162,110 @@ jobs:
             artifacts/run-context.txt
           if-no-files-found: error
           retention-days: 7
+
+  tls-diagnostics-artifact:
+    name: TLS diagnostics artifact (debug)
+    if: ${{ inputs.enable_tls == true && inputs.debug_tls_artifacts == true }}
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 10
+
+    env:
+      TLS_SECRET_NAME: ${{ vars.TLS_SECRET_NAME || 'wildcard-tls' }}
+
+      # Wildcard certificate material (recommended names in GH secrets: ELOKO_WILDCARD_CRT / ELOKO_WILDCARD_KEY)
+      # Back-compat fallback: WILDCARD_CRT / WILDCARD_KEY
+      WILDCARD_CRT: ${{ secrets.ELOKO_WILDCARD_CRT || secrets.WILDCARD_CRT || '' }}
+      WILDCARD_KEY: ${{ secrets.ELOKO_WILDCARD_KEY || secrets.WILDCARD_KEY || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Generate TLS diagnostics (no private key upload)
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          mkdir -p artifacts
+
+          CERT_FILE="artifacts/wildcard.crt"
+          KEY_FILE="artifacts/_wildcard.key"
+
+          # Write PEM material to files without printing to logs.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          crt = os.environ.get('WILDCARD_CRT', '').replace('\r\n', '\n').replace('\r', '')
+          key = os.environ.get('WILDCARD_KEY', '').replace('\r\n', '\n').replace('\r', '')
+
+          Path('artifacts/wildcard.crt').write_text(crt, encoding='utf-8')
+          Path('artifacts/_wildcard.key').write_text(key, encoding='utf-8')
+          PY
+
+          chmod 600 "${CERT_FILE}" "${KEY_FILE}" || true
+
+          {
+            echo "tls_secret_name=${TLS_SECRET_NAME}"
+            echo "cert_bytes=$(wc -c < "${CERT_FILE}" 2>/dev/null || echo 0)"
+            echo "key_bytes=$(wc -c < "${KEY_FILE}" 2>/dev/null || echo 0)"
+            echo "cert_begin_header_present=$(grep -F -q -- '-----BEGIN CERTIFICATE-----' "${CERT_FILE}" && echo true || echo false)"
+            echo "cert_end_footer_present=$(grep -F -q -- '-----END CERTIFICATE-----' "${CERT_FILE}" && echo true || echo false)"
+            echo "key_begin_header_present=$(grep -E -q -- '-----BEGIN (RSA |EC )?PRIVATE KEY-----|-----BEGIN PRIVATE KEY-----' "${KEY_FILE}" && echo true || echo false)"
+            echo "key_end_footer_present=$(grep -E -q -- '-----END (RSA |EC )?PRIVATE KEY-----|-----END PRIVATE KEY-----' "${KEY_FILE}" && echo true || echo false)"
+            echo "cert_pem_blocks=$(grep -c 'BEGIN CERTIFICATE' "${CERT_FILE}" 2>/dev/null || echo 0)"
+            # Detect literal "\n" sequences (common when PEM was pasted as a JSON-escaped string).
+            echo "cert_literal_backslash_n_count=$(grep -o '\\n' "${CERT_FILE}" 2>/dev/null | wc -l || echo 0)"
+            echo "key_literal_backslash_n_count=$(grep -o '\\n' "${KEY_FILE}" 2>/dev/null | wc -l || echo 0)"
+            echo
+            echo "--- cert first/last line (may appear as *** due to GitHub secret masking) ---"
+            head -n 1 "${CERT_FILE}" 2>/dev/null || true
+            tail -n 1 "${CERT_FILE}" 2>/dev/null || true
+            echo
+            echo "--- openssl x509 parse ---"
+            openssl x509 -in "${CERT_FILE}" -noout -subject -issuer -dates -fingerprint -sha256 2>&1 || true
+            echo
+            echo "--- openssl pkey parse (no key output) ---"
+            openssl pkey -in "${KEY_FILE}" -noout -passin pass: 2>&1 || true
+          } > artifacts/tls-diagnostics.txt
+
+          # If the key is parseable, export public key only (safe) and compute a match signal.
+          if openssl pkey -in "${KEY_FILE}" -pubout -out artifacts/wildcard.public.pem -passin pass: 2>/dev/null; then
+            chmod 600 artifacts/wildcard.public.pem || true
+
+            CERT_PUB_HASH="$(openssl x509 -in "${CERT_FILE}" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $2}' || true)"
+            KEY_PUB_HASH="$(openssl pkey -in "${KEY_FILE}" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $2}' || true)"
+
+            {
+              echo "cert_pubkey_sha256=${CERT_PUB_HASH}"
+              echo "key_pubkey_sha256=${KEY_PUB_HASH}"
+              if [[ -n "${CERT_PUB_HASH}" && -n "${KEY_PUB_HASH}" && "${CERT_PUB_HASH}" == "${KEY_PUB_HASH}" ]]; then
+                echo "cert_key_match=true"
+              else
+                echo "cert_key_match=false"
+              fi
+            } > artifacts/tls-match.txt
+          else
+            echo "cert_key_match=unknown" > artifacts/tls-match.txt
+          fi
+
+          # Do NOT leave the private key file in artifacts; keep it only transiently for diagnostics.
+          rm -f "${KEY_FILE}" || true
+
+      - name: Upload TLS diagnostics artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: tls-diagnostics
+          path: |
+            artifacts/tls-diagnostics.txt
+            artifacts/tls-match.txt
+            artifacts/wildcard.crt
+            artifacts/wildcard.public.pem
+          if-no-files-found: warn
+          retention-days: 3
 
   deploy:
     name: Deploy Traefik Ingress
@@ -411,25 +521,26 @@ jobs:
             exit 1
           fi
 
-          if ! grep -q "-----BEGIN CERTIFICATE-----" "${CERT_FILE}"; then
+          # Patterns start with dashes; use `--` to prevent grep treating them as options.
+          if ! grep -F -q -- "-----BEGIN CERTIFICATE-----" "${CERT_FILE}"; then
             echo "ERROR: WILDCARD_CRT does not look like PEM. Expected '-----BEGIN CERTIFICATE-----' header." >&2
             echo "Hint: store the raw PEM text (not base64, not PFX/DER)." >&2
             echo "Certificate first line: $(head -n 1 "${CERT_FILE}" | tr -d '\r')" >&2
             exit 1
           fi
-          if ! grep -q "-----END CERTIFICATE-----" "${CERT_FILE}"; then
+          if ! grep -F -q -- "-----END CERTIFICATE-----" "${CERT_FILE}"; then
             echo "ERROR: WILDCARD_CRT missing PEM footer '-----END CERTIFICATE-----'." >&2
             echo "Certificate last line: $(tail -n 1 "${CERT_FILE}" | tr -d '\r')" >&2
             exit 1
           fi
 
-          if ! grep -Eq "-----BEGIN (RSA |EC )?PRIVATE KEY-----|-----BEGIN PRIVATE KEY-----" "${KEY_FILE}"; then
+          if ! grep -E -q -- "-----BEGIN (RSA |EC )?PRIVATE KEY-----|-----BEGIN PRIVATE KEY-----" "${KEY_FILE}"; then
             echo "ERROR: WILDCARD_KEY does not look like PEM. Expected '-----BEGIN ... PRIVATE KEY-----' header." >&2
             echo "Hint: store the raw PEM private key (not base64, not PFX, not encrypted with a passphrase)." >&2
             echo "Key first line: $(head -n 1 "${KEY_FILE}" | tr -d '\r')" >&2
             exit 1
           fi
-          if ! grep -Eq "-----END (RSA |EC )?PRIVATE KEY-----|-----END PRIVATE KEY-----" "${KEY_FILE}"; then
+          if ! grep -E -q -- "-----END (RSA |EC )?PRIVATE KEY-----|-----END PRIVATE KEY-----" "${KEY_FILE}"; then
             echo "ERROR: WILDCARD_KEY missing PEM footer '-----END ... PRIVATE KEY-----'." >&2
             echo "Key last line: $(tail -n 1 "${KEY_FILE}" | tr -d '\r')" >&2
             exit 1

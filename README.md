@@ -144,6 +144,19 @@ openssl pkcs12 -in wildcard.pfx -nocerts -nodes -out wildcard.key
 
 The workflow also performs these validations (PEM marker checks + `openssl` parse + keypair match) before creating the Kubernetes TLS Secret.
 
+### Debugging certificate handling in the workflow
+
+If you suspect the runner-written temp files are malformed (line endings, literal `\n`, truncation), run the workflow with:
+
+- `debug_tls_artifacts=true`
+
+This triggers a separate job that uploads:
+- `wildcard.crt` (certificate / full chain)
+- `wildcard.public.pem` (public key derived from the private key)
+- `tls-diagnostics.txt` / `tls-match.txt`
+
+The private key is **never** uploaded.
+
 ### Notes by routing model
 
 - **Gateway API**: TLS is configured once on the shared Gateway listener; application `HTTPRoute` resources do not need to carry per-app certificates.

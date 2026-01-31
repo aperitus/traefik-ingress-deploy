@@ -36,6 +36,7 @@ This repo deploys **Traefik** to an **Entra-enabled AKS** cluster using **GitHub
 - `environment`: `dev|preprod|prod`
 - `routing_mode`: `gateway|ingress|both` (default: `both`)
 - `debug_values`: upload rendered values file as artifact (safe; implemented as a separate job so it still appears even when the deploy job fails)
+- `debug_tls_artifacts`: upload TLS diagnostics as artifacts (implemented as a separate job so it still appears even when the deploy job fails)
 - `enable_traefik_dashboard`: dev-only enable of Traefik API/dashboard (validated internally)
 - `enable_tls`: enable TLS on the data-plane using a wildcard certificate stored in GitHub secrets (default: true). When enabled, enforce **Option B**: keep HTTP open but redirect **HTTP → HTTPS** (`web` → `websecure`).
 
@@ -77,6 +78,9 @@ This repo deploys **Traefik** to an **Entra-enabled AKS** cluster using **GitHub
   - Notes:
     - Store **raw PEM** (must include `-----BEGIN ...-----` markers). Do not base64-encode the PEM and do not paste PFX/DER content.
     - Workflow performs PEM marker checks + `openssl` parse + cert/key match before creating the Kubernetes TLS Secret.
+    - If troubleshooting TLS material handling, run the workflow with `debug_tls_artifacts=true`:
+      - Uploads `wildcard.crt` (certificate/full-chain only) and a derived `wildcard.public.pem` (public key) plus `tls-diagnostics.txt`.
+      - **Never uploads the private key.**
 - DNS (optional):
   - `DNS_ENABLED` (`true|false`)
   - `PRIVATE_DNS_ZONE_SUBSCRIPTION_ID`

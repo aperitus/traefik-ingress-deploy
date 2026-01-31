@@ -109,6 +109,41 @@ When you run the workflow with `enable_tls=true` (default):
    - `TLS_SECRET_NAME` (default: `wildcard-tls`)
    - `GATEWAY_LISTENER_WEBSECURE_PORT` (default: `8443`)
 
+### Validating the wildcard certificate secrets
+
+The error `tls: failed to find any PEM data in certificate input` almost always means your secret is **not raw PEM**.
+
+Requirements:
+- `ELOKO_WILDCARD_CRT` must contain one or more PEM certificate blocks (starts with `-----BEGIN CERTIFICATE-----`).
+- `ELOKO_WILDCARD_KEY` must contain an unencrypted PEM private key (starts with `-----BEGIN ... PRIVATE KEY-----`).
+
+Local (safe) checks (these do **not** print the private key):
+
+```bash
+# Certificate parses and shows minimal metadata
+openssl x509 -in wildcard.crt -noout -subject -issuer -dates -fingerprint -sha256
+
+# Key parses non-interactively (fails fast if encrypted / wrong format)
+openssl pkey -in wildcard.key -noout -passin pass:
+
+# Confirm cert+key match (RSA/ECDSA): compare public-key hashes
+cert_hash=$(openssl x509 -in wildcard.crt -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 | awk '{print $2}')
+key_hash=$(openssl pkey -in wildcard.key -pubout -outform DER | openssl dgst -sha256 | awk '{print $2}')
+test "$cert_hash" = "$key_hash" && echo "MATCH" || echo "MISMATCH"
+
+# Count certificate blocks (should be >= 1; full chain often has 2+)
+grep -c 'BEGIN CERTIFICATE' wildcard.crt
+```
+
+If you have a PFX/PKCS#12 instead of PEM, convert it first:
+
+```bash
+openssl pkcs12 -in wildcard.pfx -clcerts -nokeys -out wildcard.crt
+openssl pkcs12 -in wildcard.pfx -nocerts -nodes -out wildcard.key
+```
+
+The workflow also performs these validations (PEM marker checks + `openssl` parse + keypair match) before creating the Kubernetes TLS Secret.
+
 ### Notes by routing model
 
 - **Gateway API**: TLS is configured once on the shared Gateway listener; application `HTTPRoute` resources do not need to carry per-app certificates.

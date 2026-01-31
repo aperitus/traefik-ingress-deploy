@@ -74,6 +74,9 @@ This repo deploys **Traefik** to an **Entra-enabled AKS** cluster using **GitHub
   - `ELOKO_WILDCARD_CRT` (PEM certificate / full chain)
   - `ELOKO_WILDCARD_KEY` (PEM private key)
   - Back-compat fallback names are also accepted: `WILDCARD_CRT` / `WILDCARD_KEY`
+  - Notes:
+    - Store **raw PEM** (must include `-----BEGIN ...-----` markers). Do not base64-encode the PEM and do not paste PFX/DER content.
+    - Workflow performs PEM marker checks + `openssl` parse + cert/key match before creating the Kubernetes TLS Secret.
 - DNS (optional):
   - `DNS_ENABLED` (`true|false`)
   - `PRIVATE_DNS_ZONE_SUBSCRIPTION_ID`

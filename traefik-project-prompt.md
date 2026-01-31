@@ -63,6 +63,8 @@ The repo must support enabling TLS on the Traefik data-plane using a wildcard ce
 - Certificate material is sourced from secrets:
   - Preferred: `ELOKO_WILDCARD_CRT` / `ELOKO_WILDCARD_KEY`
   - Back-compat fallback: `WILDCARD_CRT` / `WILDCARD_KEY`
+- Secrets must be **raw PEM** including `-----BEGIN ...-----` markers (not base64, not PFX/DER). Validate before attempting Kubernetes secret creation.
+- Workflow must validate: PEM markers present, `openssl` can parse cert/key non-interactively, and cert/key match.
 - Never print cert/key to logs.
 - Note: Kubernetes Ingress still requires the TLS Secret to exist in the *same namespace as the Ingress*.
 

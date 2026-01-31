@@ -1,66 +1,75 @@
-# Traefik values template (minimal, schema-compliant)
-#
-# Validate keys on your runner:
-#   helm show values traefik/traefik --version <ver> | less
+# Traefik minimal values template (schema-compliant for traefik/traefik chart)
+# Rendered to /tmp/values.traefik.generated.yaml by the workflow.
 #
 # Notes:
-# - We keep the dashboard IngressRoute disabled; the workflow validates the dashboard/API via port-forward only.
-# - We create a non-default IngressClass called "traefik" so app repos can opt-in per Ingress.
-# - This template is rendered to /tmp/values.traefik.generated.yaml at runtime (no secret material).
-
-deployment:
-  imagePullSecrets:
-    - name: "<IMAGE_PULL_SECRET_NAME>"
+# - Nexus-only images: set image.registry + image.repository to your Nexus docker repo path.
+# - Optional overrides (image.tag, service.spec.loadBalancerIP) are applied via Helm --set in the workflow.
+# - Routing mode (Ingress vs Gateway API vs Both) is controlled by the workflow via Helm --set flags.
 
 image:
-  registry: "<REGISTRY_SERVER>"
-  repository: "<TRAEFIK_IMAGE_REPOSITORY>"   # e.g. traefik/traefik (in your Nexus path)
-  tag: "<TRAEFIK_IMAGE_TAG>"                 # optional; if empty, workflow removes this key (chart defaults apply)
+  # Your internal registry host (e.g. docker-hosted-nexus.logiki.co.uk)
+  registry: <TRAEFIK_IMAGE_REGISTRY>
+  # Path under registry to Traefik image (e.g. traefik or mirrored path)
+  repository: <TRAEFIK_IMAGE_REPOSITORY>
 
-ingressClass:
-  enabled: true
-  isDefaultClass: false
-  name: "traefik"
+deployment:
+  # Use a docker-registry secret created by the workflow in the traefik namespace.
+  imagePullSecrets:
+    - name: <IMAGE_PULL_SECRET_NAME>
 
-providers:
-  kubernetesIngress:
-    enabled: true
-  kubernetesCRD:
-    enabled: true
-
-# Dashboard enabled internally only; no IngressRoute exposure from this chart.
-api:
-  dashboard: true
-  ingressRoute:
-    dashboard:
-      enabled: false
-    healthcheck:
-      enabled: false
-
-# Internal load balancer service on AKS (Azure ILB)
+# Internal-only LoadBalancer by default (Azure ILB)
 service:
   enabled: true
   type: LoadBalancer
   annotations:
     service.beta.kubernetes.io/azure-load-balancer-internal: "true"
-  spec: {}
 
-# EntryPoints: web(80), websecure(443), traefik(8080)
-# Chart schema expects expose to be an object (not a boolean).
 ports:
   web:
+    port: 8000
     expose:
       default: true
     exposedPort: 80
+    protocol: TCP
   websecure:
+    port: 8443
     expose:
       default: true
     exposedPort: 443
+    protocol: TCP
   traefik:
+    port: 8080
     expose:
       default: false
+    exposedPort: 8080
+    protocol: TCP
+  metrics:
+    port: 9100
+    expose:
+      default: false
+    exposedPort: 9100
+    protocol: TCP
 
-# Force the watched ingress class names (important if you choose a non-default name).
-additionalArguments:
-  - "--providers.kubernetesingress.ingressclass=traefik"
-  - "--providers.kubernetescrd.ingressclass=traefik"
+# Dashboard is enabled in Traefik, but not exposed via IngressRoute by default.
+# The workflow can enable it temporarily for dev-only testing.
+api:
+  dashboard: true
+  ingressRoute:
+    dashboard:
+      enabled: false
+      entryPoints:
+        - traefik
+
+# Providers default:
+# - kubernetesCRD enabled (Traefik CRDs)
+# - kubernetesIngress enabled (Kubernetes Ingress)
+# - kubernetesGateway disabled (Gateway API)
+# The workflow toggles provider enablement based on routing_mode (ingress|gateway|both).
+providers:
+  kubernetesCRD:
+    enabled: true
+    allowCrossNamespace: false
+  kubernetesIngress:
+    enabled: true
+  kubernetesGateway:
+    enabled: false

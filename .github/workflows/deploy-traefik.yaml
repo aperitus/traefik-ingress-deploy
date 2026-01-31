@@ -20,7 +20,7 @@ on:
           - both
           - gateway
           - ingress
-        default: gateway
+        default: both
 
       enable_traefik_dashboard:
         description: Enable Traefik API/Dashboard and run post-deploy API check (internal only)
@@ -72,6 +72,85 @@ permissions:
   contents: read
 
 jobs:
+  render-values-artifact:
+    name: Render values artifact (debug)
+    if: ${{ inputs.debug_values == true }}
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 10
+
+    env:
+      # Render-only job: builds the values file deterministically and uploads it as an artifact
+      # even if the deploy job fails.
+
+      # Image override placeholders (no secrets)
+      IMAGE_PULL_SECRET_NAME: ${{ secrets.IMAGE_PULL_SECRET_NAME }}
+      TRAEFIK_IMAGE_REGISTRY: ${{ vars.TRAEFIK_IMAGE_REGISTRY || secrets.REGISTRY_SERVER }}
+      TRAEFIK_IMAGE_REPOSITORY: ${{ vars.TRAEFIK_IMAGE_REPOSITORY || 'library/traefik' }}
+      TRAEFIK_IMAGE_TAG: ${{ vars.TRAEFIK_IMAGE_TAG || '' }}
+      TRAEFIK_LB_IPV4: ${{ vars.TRAEFIK_LB_IPV4 || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Verify Python on runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v python3 >/dev/null
+
+      - name: Render Helm values (no secret material printed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          mkdir -p artifacts
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          tpl = Path('helm/traefik/values.template.yaml').read_text(encoding='utf-8')
+
+          repl = {
+            '<IMAGE_PULL_SECRET_NAME>': os.environ['IMAGE_PULL_SECRET_NAME'],
+            '<TRAEFIK_IMAGE_REGISTRY>': os.environ['TRAEFIK_IMAGE_REGISTRY'],
+            '<TRAEFIK_IMAGE_REPOSITORY>': os.environ['TRAEFIK_IMAGE_REPOSITORY'],
+            '<TRAEFIK_IMAGE_TAG>': os.environ.get('TRAEFIK_IMAGE_TAG', ''),
+            '<TRAEFIK_LB_IPV4>': os.environ.get('TRAEFIK_LB_IPV4', ''),
+            # Back-compat placeholder (older template)
+            '<REGISTRY_SERVER>': os.environ['TRAEFIK_IMAGE_REGISTRY'],
+          }
+          for k, v in repl.items():
+            tpl = tpl.replace(k, v)
+
+          out = Path('artifacts/values.traefik.generated.yaml')
+          out.write_text(tpl, encoding='utf-8')
+          PY
+
+          chmod 600 artifacts/values.traefik.generated.yaml
+
+          # Lightweight, non-sensitive run context to help debug failures.
+          {
+            echo "environment=${{ inputs.environment }}"
+            echo "routing_mode=${{ inputs.routing_mode }}"
+            echo "enable_traefik_dashboard=${{ inputs.enable_traefik_dashboard }}"
+            echo "workflow_ref=${GITHUB_REF}"
+            echo "workflow_sha=${GITHUB_SHA}"
+          } > artifacts/run-context.txt
+
+      - name: Upload rendered values artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: values-traefik-generated
+          path: |
+            artifacts/values.traefik.generated.yaml
+            artifacts/run-context.txt
+          if-no-files-found: error
+          retention-days: 7
+
   deploy:
     name: Deploy Traefik Ingress
     runs-on: self-hosted
@@ -81,6 +160,9 @@ jobs:
     env:
       TRAEFIK_NAMESPACE: traefik
       TRAEFIK_RELEASE: traefik
+
+      # Isolate Azure CLI state to avoid runner-global cache/token issues.
+      AZURE_CONFIG_DIR: /tmp/azcfg
 
       # Isolate kubeconfig to avoid runner-global state.
       KUBECONFIG: /tmp/kubeconfig
@@ -164,8 +246,9 @@ jobs:
           : "${AZURE_TENANT_ID:?AZURE_TENANT_ID empty}"
           : "${AZURE_SUBSCRIPTION_ID:?AZURE_SUBSCRIPTION_ID empty}"
 
-          # Force non-interactive Azure CLI behaviour by isolating config and clearing any stale context
-          export AZURE_CONFIG_DIR="/tmp/azcfg"
+          # Force non-interactive Azure CLI behaviour by isolating config and clearing any stale context.
+          # This ensures deterministic behaviour on long-lived self-hosted runners.
+          rm -rf "${AZURE_CONFIG_DIR}" 2>/dev/null || true
           mkdir -p "${AZURE_CONFIG_DIR}"
           az logout --output=none 2>/dev/null || true
           az account clear --output=none 2>/dev/null || true
@@ -289,15 +372,6 @@ jobs:
           PY
 
           chmod 600 /tmp/values.traefik.generated.yaml
-
-      - name: Upload generated values file as artifact (debug)
-        if: ${{ inputs.debug_values == true }}
-        uses: actions/upload-artifact@v3
-        with:
-          name: values-traefik-generated
-          path: /tmp/values.traefik.generated.yaml
-          if-no-files-found: error
-          retention-days: 7
 
       - name: Install/upgrade Traefik (official chart; images pulled from Nexus)
         shell: bash
@@ -539,19 +613,14 @@ jobs:
           : "${AZURE_TENANT_ID:?AZURE_TENANT_ID empty}"
           : "${AZURE_SUBSCRIPTION_ID:?AZURE_SUBSCRIPTION_ID empty}"
 
-          # Force non-interactive Azure CLI behaviour by isolating config and clearing any stale context
-          export AZURE_CONFIG_DIR="/tmp/azcfg"
-          mkdir -p "${AZURE_CONFIG_DIR}"
-          az logout --output=none 2>/dev/null || true
-          az account clear --output=none 2>/dev/null || true
-
+          # Re-login here to ensure Azure CLI has a fresh, valid context
+          # before switching subscription for cross-subscription DNS updates.
           az login \
-          --service-principal \
-          --username="${DEPLOY_CLIENT_ID}" \
-          --password="${DEPLOY_SECRET}" \
-          --tenant="${AZURE_TENANT_ID}" \
-          --output=none
-
+            --service-principal \
+            --username="${DEPLOY_CLIENT_ID}" \
+            --password="${DEPLOY_SECRET}" \
+            --tenant="${AZURE_TENANT_ID}" \
+            --output=none
           az account set --subscription="${PRIVATE_DNS_ZONE_SUBSCRIPTION_ID}"
 
           echo "Checking for existing A record-set '${PRIVATE_DNS_A_RECORD_NAME}' in zone '${PRIVATE_DNS_ZONE_NAME}'..."

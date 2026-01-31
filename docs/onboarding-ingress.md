@@ -60,11 +60,16 @@ If you later migrate to Gateway API, keep the app’s Service as-is; replace the
 If the platform Gateway is configured with `namespacePolicy.from: Selector`, your app namespace must carry the label **as a string**:
 
 ```bash
-kubectl label namespace <your-namespace> traefik-gateway-access=true --overwrite
+kubectl label namespace <your-namespace> traefik-gateway-access=enabled --overwrite
 ```
 
-(Labels are always strings. The workflow uses `--set-string` to avoid Helm converting `true` into a boolean.)
+(Labels are always strings, but the deployment workflow explicitly rejects boolean-like values (`true/false/yes/no/on/off/null/~`).
+Use a clear string value with at least one letter (default: `enabled`).)
 
 
 ### Dashboard/API verification (internal-only)
-The deployment workflow can enable Traefik's internal API/dashboard on the admin entrypoint for **service-proxy validation** by setting `enable_traefik_dashboard=true` (this sets `api.dashboard=true` and `api.insecure=true`). Use this only for internal/dev validation and do not expose it externally without authentication.
+The deployment workflow can enable Traefik's internal API/dashboard on the admin entrypoint by setting `enable_traefik_dashboard=true` (this sets `api.dashboard=true` and `api.insecure=true`).
+
+Validation is performed internally by creating a `traefik-dashboard` **ClusterIP** Service and running an **in-cluster Job** that calls `http://traefik-dashboard:8080/api/version` using a Nexus-hosted test image (must include `curl` or `wget`).
+
+Use this only for internal/dev validation and do not expose it externally without authentication.

@@ -35,7 +35,7 @@ This repo deploys **Traefik** to an **Entra-enabled AKS** cluster using **GitHub
 
 - `environment`: `dev|preprod|prod`
 - `routing_mode`: `gateway|ingress|both` (default: `both`)
-- `debug_values`: upload rendered values file as artifact (safe)
+- `debug_values`: upload rendered values file as artifact (safe; implemented as a separate job so it still appears even when the deploy job fails)
 - `enable_traefik_dashboard`: dev-only enable of Traefik API/dashboard (validated internally)
 
 ### Repository/Environment variables (vars)
@@ -88,7 +88,8 @@ Optional (dev-only):
 - When `enable_traefik_dashboard=true`, the workflow:
   1) Enables `api.dashboard=true` and `api.insecure=true` (internal admin port only).
   2) Creates an internal-only `traefik-dashboard` **ClusterIP** Service on port `8080`.
-  3) Validates `/api/version` via the **kube-apiserver Service proxy** (`kubectl get --raw .../services/.../proxy/api/version`) — no port-forward required.
+  3) Validates `/api/version` by running an **in-cluster Job** (using a Nexus-hosted test image containing `curl` or `wget`) that calls `http://traefik-dashboard:8080/api/version`.
+     - This avoids kube-apiserver service proxy behaviour differences and keeps the check fully in-cluster.
 
 ## Deliverables (repo contents)
 

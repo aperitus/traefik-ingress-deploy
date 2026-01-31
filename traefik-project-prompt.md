@@ -42,6 +42,8 @@ The repo must support:
 
 Routing mode is selected by workflow input `routing_mode`.
 
+**Default routing mode**: `both`.
+
 ## Access control guidance
 
 - Prefer Gateway mode with `GATEWAY_ALLOWED_ROUTES_FROM=Selector` and onboard namespaces by label.
@@ -54,7 +56,12 @@ Routing mode is selected by workflow input `routing_mode`.
 - If dashboard testing is enabled (`enable_traefik_dashboard=true`):
   - Enable `api.dashboard=true` and `api.insecure=true` (internal admin port only).
   - Create an internal-only `traefik-dashboard` ClusterIP service on port `8080`.
-  - Validate `/api/version` via **kube-apiserver Service proxy** using `kubectl get --raw .../services/.../proxy/api/version`.
+  - Validate `/api/version` with an **in-cluster Job** that calls `http://traefik-dashboard:8080/api/version` using a Nexus-hosted test image (must contain `curl` or `wget`).
+
+## Debug artifacts
+
+- If `debug_values=true`, render and upload the generated values file as a workflow artifact.
+- The artifact upload should be performed in a **separate job** (not as a step within the deployment job) so it still appears even when the deployment job fails.
 
 ## DNS update
 

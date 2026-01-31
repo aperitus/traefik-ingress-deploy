@@ -80,7 +80,7 @@ The repo must support enabling TLS on the Traefik data-plane using a wildcard ce
 
 - If `debug_values=true`, render and upload the generated values file as a workflow artifact.
 - The artifact upload should be performed in a **separate job** (not as a step within the deployment job) so it still appears even when the deployment job fails.
-- If `debug_tls_artifacts=true` and `enable_tls=true`, upload TLS diagnostics as a workflow artifact (also as a separate job):
+- If `debug_values=true` and `enable_tls=true`, upload TLS diagnostics as a workflow artifact (also as a separate job):
   - Upload the certificate file (`wildcard.crt`) and a derived public key (`wildcard.public.pem`) plus diagnostic text.
   - **Never upload the private key.**
 

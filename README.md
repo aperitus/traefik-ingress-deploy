@@ -148,12 +148,15 @@ The workflow also performs these validations (PEM marker checks + `openssl` pars
 
 If you suspect the runner-written temp files are malformed (line endings, literal `\n`, truncation), run the workflow with:
 
-- `debug_tls_artifacts=true`
+- `debug_values=true`
 
-This triggers a separate job that uploads:
+This triggers separate debug jobs that upload:
 - `wildcard.crt` (certificate / full chain)
 - `wildcard.public.pem` (public key derived from the private key)
 - `tls-diagnostics.txt` / `tls-match.txt`
+
+It also uploads:
+- `values.traefik.generated.yaml` (safe: contains no secrets)
 
 The private key is **never** uploaded.
 

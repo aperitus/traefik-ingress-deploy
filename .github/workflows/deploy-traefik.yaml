@@ -29,7 +29,7 @@ on:
         default: false
 
       debug_values:
-        description: "Upload generated values file as a workflow artifact (safe: contains no secrets)"
+        description: "Upload debug artifacts (generated values; and if TLS enabled, certificate diagnostics — certificate/public-key only)"
         required: false
         type: boolean
         default: false
@@ -39,12 +39,6 @@ on:
         required: false
         type: boolean
         default: true
-
-      debug_tls_artifacts:
-        description: "DEBUG: Upload TLS certificate diagnostics as workflow artifacts (certificate only; never uploads private key)."
-        required: false
-        type: boolean
-        default: false
 
       aks_resource_group:
         description: AKS resource group (optional; defaults to vars.AKS_RESOURCE_GROUP)
@@ -165,7 +159,7 @@ jobs:
 
   tls-diagnostics-artifact:
     name: TLS diagnostics artifact (debug)
-    if: ${{ inputs.enable_tls == true && inputs.debug_tls_artifacts == true }}
+    if: ${{ inputs.enable_tls == true && inputs.debug_values == true }}
     runs-on: self-hosted
     environment: ${{ inputs.environment }}
     timeout-minutes: 10

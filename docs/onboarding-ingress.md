@@ -7,6 +7,28 @@ Use this mode when your application Helm chart natively creates a Kubernetes `In
 - Traefik deployed with `routing_mode=ingress` or `routing_mode=both`.
 - Your app namespace exists (e.g., `dependency-track`).
 - Your app repo has Kubernetes RBAC to deploy into its namespace and create `Ingress`.
+- When the platform workflow runs with `enable_tls=true` (default), HTTP is redirected to HTTPS at the Traefik entrypoint.
+  That means **Ingress resources must be TLS-capable** (define `spec.tls`) or clients will be redirected to HTTPS where no router exists (typically `404` or TLS mismatch).
+- The TLS Secret referenced by the Ingress must exist **in the same namespace as the Ingress**.
+
+### TLS Secret requirement (Ingress)
+
+Kubernetes Ingress TLS looks up `spec.tls[].secretName` in the **Ingress namespace**. The wildcard TLS Secret created by this repo in the `traefik` namespace is not automatically available to app namespaces.
+
+Options:
+
+1) **Create the TLS Secret as part of the app deployment** (recommended)
+   - Your app pipeline creates `wildcard-tls` (or another name) in its namespace from the same wildcard certificate material.
+
+2) **Manual creation (operator)**
+   - Example (replace file paths):
+
+```bash
+kubectl -n myapp create secret tls wildcard-tls \
+  --cert=./wildcard.crt \
+  --key=./wildcard.key \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
 
 ## Minimal Ingress example
 

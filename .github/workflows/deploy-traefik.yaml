@@ -34,6 +34,12 @@ on:
         type: boolean
         default: false
 
+      enable_tls:
+        description: Enable TLS on the Traefik data-plane using a wildcard cert stored in GitHub secrets (Gateway HTTPS listener + TLS secret in traefik namespace; also redirects HTTP -> HTTPS)
+        required: false
+        type: boolean
+        default: true
+
       aks_resource_group:
         description: AKS resource group (optional; defaults to vars.AKS_RESOURCE_GROUP)
         required: false
@@ -177,6 +183,8 @@ jobs:
       ENABLE_TRAEFIK_DASHBOARD: ${{ inputs.enable_traefik_dashboard }}
       DEBUG_VALUES: ${{ inputs.debug_values }}
 
+      ENABLE_TLS: ${{ inputs.enable_tls }}
+
       # Helm chart repo (Traefik official repo by default)
       TRAEFIK_HELM_REPO_URL: ${{ vars.TRAEFIK_HELM_REPO_URL || 'https://traefik.github.io/charts' }}
 
@@ -218,6 +226,17 @@ jobs:
       # IMPORTANT: Traefik chart entrypoint port for "web" in values.template.yaml is 8000 by default.
       # The Gateway listener port should align to entrypoint port to avoid controller mismatches.
       GATEWAY_LISTENER_WEB_PORT: ${{ vars.GATEWAY_LISTENER_WEB_PORT || '8000' }}
+
+      # TLS (optional)
+      # - For Gateway API, TLS is configured on the Gateway listener (HTTPS) and references a Secret in the traefik namespace.
+      # - For classic Ingress, each app namespace must have its own TLS Secret referenced by the Ingress spec.
+      TLS_SECRET_NAME: ${{ vars.TLS_SECRET_NAME || 'wildcard-tls' }}
+      GATEWAY_LISTENER_WEBSECURE_PORT: ${{ vars.GATEWAY_LISTENER_WEBSECURE_PORT || '8443' }}
+
+      # Wildcard certificate material (recommended names in GH secrets: ELOKO_WILDCARD_CRT / ELOKO_WILDCARD_KEY)
+      # Back-compat fallback: WILDCARD_CRT / WILDCARD_KEY
+      WILDCARD_CRT: ${{ secrets.ELOKO_WILDCARD_CRT || secrets.WILDCARD_CRT || '' }}
+      WILDCARD_KEY: ${{ secrets.ELOKO_WILDCARD_KEY || secrets.WILDCARD_KEY || '' }}
 
     steps:
       - name: Checkout
@@ -304,6 +323,13 @@ jobs:
             : "${TRAEFIK_TEST_IMAGE:?Set vars.TRAEFIK_TEST_IMAGE to a Nexus-hosted image containing curl or wget}"
           fi
 
+          # TLS material required only when enabled
+          if [[ "${ENABLE_TLS}" == "true" ]]; then
+            : "${TLS_SECRET_NAME:?Set vars.TLS_SECRET_NAME (or accept default 'wildcard-tls')}"
+            : "${WILDCARD_CRT:?Set secrets.ELOKO_WILDCARD_CRT (or secrets.WILDCARD_CRT) to the PEM certificate/full chain}"
+            : "${WILDCARD_KEY:?Set secrets.ELOKO_WILDCARD_KEY (or secrets.WILDCARD_KEY) to the PEM private key}"
+          fi
+
       - name: Get AKS credentials (Entra) + kubelogin convert
         shell: bash
         run: |
@@ -342,6 +368,40 @@ jobs:
           umask 077
 
           kubectl --namespace="${TRAEFIK_NAMESPACE}" create secret docker-registry "${IMAGE_PULL_SECRET_NAME}"             --docker-server="${REGISTRY_SERVER}"             --docker-username="${REGISTRY_USERNAME}"             --docker-password="${REGISTRY_PASSWORD}"             --dry-run=client --output=yaml             | kubectl apply --filename=-
+
+      - name: Create/update TLS secret (wildcard) in Traefik namespace
+        if: ${{ inputs.enable_tls == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          : "${TLS_SECRET_NAME:?TLS_SECRET_NAME empty}"
+          : "${WILDCARD_CRT:?WILDCARD_CRT empty}"
+          : "${WILDCARD_KEY:?WILDCARD_KEY empty}"
+
+          # Write PEM material to temp files without printing to logs.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          crt = os.environ['WILDCARD_CRT'].replace('\r\n', '\n')
+          key = os.environ['WILDCARD_KEY'].replace('\r\n', '\n')
+
+          Path('/tmp/wildcard.crt').write_text(crt, encoding='utf-8')
+          Path('/tmp/wildcard.key').write_text(key, encoding='utf-8')
+          PY
+
+          chmod 600 /tmp/wildcard.crt /tmp/wildcard.key
+
+          kubectl --namespace="${TRAEFIK_NAMESPACE}" create secret tls "${TLS_SECRET_NAME}" \
+            --cert=/tmp/wildcard.crt \
+            --key=/tmp/wildcard.key \
+            --dry-run=client --output=yaml \
+            | kubectl apply --filename=-
+
+          # Cleanup to reduce secret material residency on the runner.
+          rm -f /tmp/wildcard.crt /tmp/wildcard.key
 
       - name: Render Helm values (no secret material printed)
         shell: bash
@@ -383,6 +443,10 @@ jobs:
 
           EXTRA_ARGS=()
 
+          # We build additionalArguments as an indexed list so multiple features can append args safely.
+          # (TLS redirect + optional dashboard/API enablement)
+          AA_IDX=0
+
           # routing mode toggles
           if [[ "${ROUTING_MODE}" == "ingress" || "${ROUTING_MODE}" == "both" ]]; then
             EXTRA_ARGS+=(--set "providers.kubernetesIngress.enabled=true")
@@ -402,13 +466,27 @@ jobs:
             EXTRA_ARGS+=(--set "gateway.enabled=false")
           fi
 
-          # enable dashboard/API only when requested (internal-only service check)
+          # If TLS is enabled (default), enforce Option B: keep HTTP open but redirect HTTP -> HTTPS.
+          # This is implemented as an entryPoint redirect from 'web' to 'websecure'.
+          if [[ "${ENABLE_TLS}" == "true" ]]; then
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--entrypoints.web.http.redirections.entryPoint.to=websecure)
+            AA_IDX=$((AA_IDX + 1))
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--entrypoints.web.http.redirections.entryPoint.scheme=https)
+            AA_IDX=$((AA_IDX + 1))
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--entrypoints.web.http.redirections.entryPoint.permanent=true)
+            AA_IDX=$((AA_IDX + 1))
+          fi
+
+          # Enable dashboard/API only when requested (internal-only service check)
           if [[ "${ENABLE_TRAEFIK_DASHBOARD}" == "true" ]]; then
             # Traefik API/dashboard are not served on :8080 unless explicitly exposed.
             # Use CLI flags to expose /api + /dashboard on the internal 'traefik' entryPoint.
-            EXTRA_ARGS+=(--set-string=additionalArguments[0]=--api=true)
-            EXTRA_ARGS+=(--set-string=additionalArguments[1]=--api.dashboard=true)
-            EXTRA_ARGS+=(--set-string=additionalArguments[2]=--api.insecure=true)
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--api=true)
+            AA_IDX=$((AA_IDX + 1))
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--api.dashboard=true)
+            AA_IDX=$((AA_IDX + 1))
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--api.insecure=true)
+            AA_IDX=$((AA_IDX + 1))
           fi
 
           helm upgrade --install "${TRAEFIK_RELEASE}" traefik/traefik             --namespace="${TRAEFIK_NAMESPACE}"             --version="${TRAEFIK_CHART_VERSION}"             --values="/tmp/values.traefik.generated.yaml"             "${EXTRA_ARGS[@]}"             --wait --atomic --timeout="${HELM_TIMEOUT}"
@@ -424,8 +502,54 @@ jobs:
 
           # GatewayClass controllerName for Traefik
           # Reference: traefik.io/gateway-controller
+          if [[ "${ENABLE_TLS}" == "true" ]]; then
+            : "${TLS_SECRET_NAME:?TLS_SECRET_NAME empty}"
+          fi
+
           if [[ "${GATEWAY_ALLOWED_ROUTES_FROM}" == "Selector" ]]; then
-            cat <<EOF | kubectl apply --filename=-
+            if [[ "${ENABLE_TLS}" == "true" ]]; then
+              cat <<EOF | kubectl apply --filename=-
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: GatewayClass
+          metadata:
+            name: traefik
+          spec:
+            controllerName: traefik.io/gateway-controller
+          ---
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: traefik
+            namespace: ${TRAEFIK_NAMESPACE}
+          spec:
+            gatewayClassName: traefik
+            listeners:
+              - name: web
+                protocol: HTTP
+                port: ${GATEWAY_LISTENER_WEB_PORT}
+                allowedRoutes:
+                  namespaces:
+                    from: Selector
+                    selector:
+                      matchLabels:
+                        ${GATEWAY_ALLOWED_ROUTES_LABEL_KEY}: "${GATEWAY_ALLOWED_ROUTES_LABEL_VALUE}"
+              - name: websecure
+                protocol: HTTPS
+                port: ${GATEWAY_LISTENER_WEBSECURE_PORT}
+                tls:
+                  mode: Terminate
+                  certificateRefs:
+                    - kind: Secret
+                      name: ${TLS_SECRET_NAME}
+                allowedRoutes:
+                  namespaces:
+                    from: Selector
+                    selector:
+                      matchLabels:
+                        ${GATEWAY_ALLOWED_ROUTES_LABEL_KEY}: "${GATEWAY_ALLOWED_ROUTES_LABEL_VALUE}"
+          EOF
+            else
+              cat <<EOF | kubectl apply --filename=-
           apiVersion: gateway.networking.k8s.io/v1
           kind: GatewayClass
           metadata:
@@ -451,8 +575,45 @@ jobs:
                       matchLabels:
                         ${GATEWAY_ALLOWED_ROUTES_LABEL_KEY}: "${GATEWAY_ALLOWED_ROUTES_LABEL_VALUE}"
           EOF
+            fi
           else
-            cat <<EOF | kubectl apply --filename=-
+            if [[ "${ENABLE_TLS}" == "true" ]]; then
+              cat <<EOF | kubectl apply --filename=-
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: GatewayClass
+          metadata:
+            name: traefik
+          spec:
+            controllerName: traefik.io/gateway-controller
+          ---
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: traefik
+            namespace: ${TRAEFIK_NAMESPACE}
+          spec:
+            gatewayClassName: traefik
+            listeners:
+              - name: web
+                protocol: HTTP
+                port: ${GATEWAY_LISTENER_WEB_PORT}
+                allowedRoutes:
+                  namespaces:
+                    from: ${GATEWAY_ALLOWED_ROUTES_FROM}
+              - name: websecure
+                protocol: HTTPS
+                port: ${GATEWAY_LISTENER_WEBSECURE_PORT}
+                tls:
+                  mode: Terminate
+                  certificateRefs:
+                    - kind: Secret
+                      name: ${TLS_SECRET_NAME}
+                allowedRoutes:
+                  namespaces:
+                    from: ${GATEWAY_ALLOWED_ROUTES_FROM}
+          EOF
+            else
+              cat <<EOF | kubectl apply --filename=-
           apiVersion: gateway.networking.k8s.io/v1
           kind: GatewayClass
           metadata:
@@ -475,6 +636,7 @@ jobs:
                   namespaces:
                     from: ${GATEWAY_ALLOWED_ROUTES_FROM}
           EOF
+            fi
           fi
 
           kubectl --namespace="${TRAEFIK_NAMESPACE}" get gateway traefik --output=yaml

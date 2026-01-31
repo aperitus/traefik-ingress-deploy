@@ -36,6 +36,10 @@ Run the GitHub Action: **Deploy Traefik Ingress (AKS)**.
 - Azure: `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `DEPLOY_CLIENT_ID`, `DEPLOY_SECRET`
 - Nexus registry auth: `REGISTRY_SERVER`, `REGISTRY_USERNAME`, `REGISTRY_PASSWORD`, `IMAGE_PULL_SECRET_NAME`
 - Optional DNS: `DNS_ENABLED`, `PRIVATE_DNS_ZONE_*`
+- TLS (enabled by default; set workflow input `enable_tls=false` to run without TLS):
+  - `ELOKO_WILDCARD_CRT` (PEM certificate / full chain)
+  - `ELOKO_WILDCARD_KEY` (PEM private key)
+  - Back-compat fallback names are also accepted: `WILDCARD_CRT` / `WILDCARD_KEY`
 
 
 ### Runner prerequisites
@@ -82,6 +86,38 @@ Ingress mode is less opinionated; you should enforce:
 - Policy: require `spec.ingressClassName: traefik`, TLS enabled, and restrict hostnames to approved zones.
 
 See: `docs/onboarding-ingress.md`
+
+## TLS enablement (wildcard certificate)
+
+This repo can configure TLS on the Traefik data-plane using a wildcard certificate stored in GitHub Environment secrets. TLS is **enabled by default** (`enable_tls=true`).
+
+### What the workflow does when TLS is enabled
+
+When you run the workflow with `enable_tls=true` (default):
+
+- it creates/updates a Kubernetes TLS Secret in the `traefik` namespace (default name: `wildcard-tls`)
+- it adds an **HTTPS** listener (`websecure`) to the shared `Gateway` (Gateway API mode) that references that Secret
+- it enforces **Option B**: keep HTTP open but redirect **HTTP → HTTPS** at the Traefik entrypoint (`web` → `websecure`)
+
+### Configure inputs/vars
+
+1) Store your wildcard material as Environment secrets (recommended names):
+   - `ELOKO_WILDCARD_CRT` (PEM certificate; include full chain)
+   - `ELOKO_WILDCARD_KEY` (PEM private key)
+
+2) Optional Environment vars:
+   - `TLS_SECRET_NAME` (default: `wildcard-tls`)
+   - `GATEWAY_LISTENER_WEBSECURE_PORT` (default: `8443`)
+
+### Notes by routing model
+
+- **Gateway API**: TLS is configured once on the shared Gateway listener; application `HTTPRoute` resources do not need to carry per-app certificates.
+- **Kubernetes Ingress**: the referenced TLS Secret must exist **in the same namespace as the Ingress**. The Secret created by this repo in `traefik` is not automatically available in application namespaces.
+  - If you create HTTP-only Ingress resources (no `spec.tls`), the platform-wide HTTP→HTTPS redirect will send clients to HTTPS where no router exists, typically resulting in `404` or a TLS mismatch. Treat TLS on Ingress as mandatory when `enable_tls=true`.
+
+See also:
+- `docs/onboarding-gateway-api.md` (Gateway API)
+- `docs/onboarding-ingress.md` (Ingress)
 
 ## Dashboard testing
 

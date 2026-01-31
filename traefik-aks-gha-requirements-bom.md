@@ -37,6 +37,7 @@ This repo deploys **Traefik** to an **Entra-enabled AKS** cluster using **GitHub
 - `routing_mode`: `gateway|ingress|both` (default: `both`)
 - `debug_values`: upload rendered values file as artifact (safe; implemented as a separate job so it still appears even when the deploy job fails)
 - `enable_traefik_dashboard`: dev-only enable of Traefik API/dashboard (validated internally)
+- `enable_tls`: enable TLS on the data-plane using a wildcard certificate stored in GitHub secrets (default: true). When enabled, enforce **Option B**: keep HTTP open but redirect **HTTP → HTTPS** (`web` → `websecure`).
 
 ### Repository/Environment variables (vars)
 
@@ -54,6 +55,11 @@ This repo deploys **Traefik** to an **Entra-enabled AKS** cluster using **GitHub
   - `GATEWAY_ALLOWED_ROUTES_LABEL_VALUE` (default `enabled`)
     - **Must be a string** (avoid values like `true`, `false`, `yes`, `no`, `on`, `off`, `null`, `0`, `1`)
 
+- **TLS** (used when `enable_tls=true`, which is the default):
+  - `TLS_SECRET_NAME` (default `wildcard-tls`)
+  - `GATEWAY_LISTENER_WEBSECURE_PORT` (default `8443`)
+
+
 ### Secrets (Environment secrets)
 
 - `AZURE_TENANT_ID`
@@ -64,6 +70,10 @@ This repo deploys **Traefik** to an **Entra-enabled AKS** cluster using **GitHub
 - `REGISTRY_USERNAME`
 - `REGISTRY_PASSWORD`
 - `IMAGE_PULL_SECRET_NAME`
+- TLS (required by default; set workflow input `enable_tls=false` to run without TLS):
+  - `ELOKO_WILDCARD_CRT` (PEM certificate / full chain)
+  - `ELOKO_WILDCARD_KEY` (PEM private key)
+  - Back-compat fallback names are also accepted: `WILDCARD_CRT` / `WILDCARD_KEY`
 - DNS (optional):
   - `DNS_ENABLED` (`true|false`)
   - `PRIVATE_DNS_ZONE_SUBSCRIPTION_ID`

@@ -63,12 +63,32 @@ spec:
 
 ### Step 3 — TLS options
 
-Gateway API TLS is configured at the **Gateway listener** (not on each HTTPRoute). The Traefik chart includes an example `websecure` listener but it’s disabled by default because it requires `certificateRefs`. 
+Gateway API TLS is configured at the **Gateway listener** (not on each HTTPRoute).
 
-Recommended approach:
+In this repo, TLS enablement is workflow-driven:
 
-- Keep `web` (HTTP) available only internally or redirect at the app layer.
-- Enable `websecure` when you are ready to manage TLS via Gateway listener certificates (typically using a namespaced Secret referenced by the Gateway).
+1) Store your wildcard certificate in the GitHub Environment as secrets:
+   - `ELOKO_WILDCARD_CRT` (PEM certificate; include full chain)
+   - `ELOKO_WILDCARD_KEY` (PEM private key)
+
+2) Run the deploy workflow with:
+   - `routing_mode=gateway` or `routing_mode=both`
+   - `enable_tls=true` (default)
+
+The workflow will:
+- Create/update a Kubernetes TLS Secret in the `traefik` namespace (default name: `wildcard-tls`, configurable via `vars.TLS_SECRET_NAME`)
+- Add a `websecure` (**HTTPS**) listener to the shared `Gateway` that references that Secret
+- Enforce **Option B**: keep HTTP open but redirect **HTTP → HTTPS** at the Traefik entrypoint (`web` → `websecure`)
+- Enforce a platform-wide redirect: keep HTTP open but redirect **HTTP → HTTPS** (`web` → `websecure`)
+
+Verify listeners:
+
+```bash
+kubectl -n traefik get gateway traefik -o yaml
+```
+
+> Some Gateway API controllers require binding an `HTTPRoute` to a specific listener via `parentRefs[].sectionName`.
+> If required, set `sectionName: websecure` on the parentRef.
 
 ## Controlling access
 
@@ -80,4 +100,8 @@ This is the core control that makes Gateway API attractive for shared ingress pl
 
 
 ### Dashboard/API verification (internal-only)
-The deployment workflow can enable Traefik's internal API/dashboard on the admin entrypoint for **service-proxy validation** by setting `enable_traefik_dashboard=true` (this sets `api.dashboard=true` and `api.insecure=true`). Use this only for internal/dev validation and do not expose it externally without authentication.
+The deployment workflow can enable Traefik's internal API/dashboard on the admin entrypoint by setting `enable_traefik_dashboard=true`.
+
+Validation is performed internally by creating a `traefik-dashboard` **ClusterIP** Service and running an **in-cluster Job** that calls `http://traefik-dashboard:8080/api/version` using a Nexus-hosted test image (must include `curl` or `wget`).
+
+Use this only for internal/dev validation and do not expose it externally without authentication.

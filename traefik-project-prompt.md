@@ -50,6 +50,22 @@ Routing mode is selected by workflow input `routing_mode`.
 - Gateway selector label values are **strings**; avoid boolean-like values (`true/false/yes/no/on/off/null`) or pure numbers.
 - If Ingress mode is used, require explicit `ingressClassName=traefik` and enforce hostname/TLS rules via policy where possible.
 
+## TLS enablement
+
+The repo must support enabling TLS on the Traefik data-plane using a wildcard certificate stored in GitHub Environment secrets.
+
+- Workflow input `enable_tls=true` enables TLS support and is the **default**.
+- When enabled:
+  - Create/update a Kubernetes TLS Secret in the `traefik` namespace (name from `vars.TLS_SECRET_NAME`, default `wildcard-tls`).
+  - Add an HTTPS listener (`websecure`) to the shared Gateway (Gateway API modes) referencing that Secret via `certificateRefs`.
+  - HTTPS listener port is set by `vars.GATEWAY_LISTENER_WEBSECURE_PORT` (default `8443`).
+  - Enforce **Option B**: keep HTTP open but redirect **HTTP → HTTPS** at the Traefik entrypoint (`web` → `websecure`) whenever TLS is enabled.
+- Certificate material is sourced from secrets:
+  - Preferred: `ELOKO_WILDCARD_CRT` / `ELOKO_WILDCARD_KEY`
+  - Back-compat fallback: `WILDCARD_CRT` / `WILDCARD_KEY`
+- Never print cert/key to logs.
+- Note: Kubernetes Ingress still requires the TLS Secret to exist in the *same namespace as the Ingress*.
+
 ## Post-deploy checks
 
 - Must verify Traefik is ready and has an ILB IP assigned.

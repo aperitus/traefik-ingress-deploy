@@ -22,26 +22,33 @@ on:
           - ingress
         default: both
 
+
       enable_traefik_dashboard:
         description: Enable Traefik API/Dashboard and run post-deploy API check (internal only)
         required: false
         type: boolean
         default: false
-
+        
       debug_values:
         description: "Upload generated values file as a workflow artifact (safe: contains no secrets)"
         required: false
         type: boolean
         default: false
 
+      enable_tls:
+        description: Enable TLS on the Traefik data-plane using a wildcard cert stored in GitHub secrets (Gateway HTTPS listener + TLS secret in traefik namespace; also redirects HTTP -> HTTPS)
+        required: false
+        type: boolean
+        default: true
+
       aks_resource_group:
-        description: AKS resource group (optional; defaults to vars.AKS_RESOURCE_GROUP)
+        description: AKS resource group (optional; defaults to vars.AKS_RESOURCE_GROUP, then secrets.AKS_RESOURCE_GROUP)
         required: false
         type: string
         default: ""
 
       aks_cluster_name:
-        description: AKS cluster name (optional; defaults to vars.AKS_CLUSTER_NAME)
+        description: AKS cluster name (optional; defaults to vars.AKS_CLUSTER_NAME, then secrets.AKS_CLUSTER_NAME)
         required: false
         type: string
         default: ""
@@ -53,13 +60,13 @@ on:
         default: false
 
       traefik_chart_version:
-        description: Traefik chart version (optional; defaults to vars.TRAEFIK_CHART_VERSION)
+        description: Traefik chart version (optional; defaults to vars.TRAEFIK_CHART_VERSION, then secrets.TRAEFIK_CHART_VERSION)
         required: false
         type: string
         default: ""
 
       helm_timeout:
-        description: Helm timeout (optional; defaults to vars.HELM_TIMEOUT)
+        description: Helm timeout (optional; defaults to vars.HELM_TIMEOUT, then secrets.HELM_TIMEOUT)
         required: false
         type: string
         default: ""
@@ -84,11 +91,11 @@ jobs:
       # even if the deploy job fails.
 
       # Image override placeholders (no secrets)
-      IMAGE_PULL_SECRET_NAME: ${{ secrets.IMAGE_PULL_SECRET_NAME }}
-      TRAEFIK_IMAGE_REGISTRY: ${{ vars.TRAEFIK_IMAGE_REGISTRY || secrets.REGISTRY_SERVER }}
-      TRAEFIK_IMAGE_REPOSITORY: ${{ vars.TRAEFIK_IMAGE_REPOSITORY || 'library/traefik' }}
+      IMAGE_PULL_SECRET_NAME: ${{ vars.IMAGE_PULL_SECRET_NAME || secrets.IMAGE_PULL_SECRET_NAME }}
+      TRAEFIK_IMAGE_REGISTRY: ${{ vars.TRAEFIK_IMAGE_REGISTRY || vars.REGISTRY_SERVER || secrets.REGISTRY_SERVER }}
+      TRAEFIK_IMAGE_REPOSITORY: ${{ vars.TRAEFIK_IMAGE_REPOSITORY || secrets.TRAEFIK_IMAGE_REPOSITORY || 'library/traefik' }}
       TRAEFIK_IMAGE_TAG: ${{ vars.TRAEFIK_IMAGE_TAG || '' }}
-      TRAEFIK_LB_IPV4: ${{ vars.TRAEFIK_LB_IPV4 || '' }}
+      TRAEFIK_LB_IPV4: ${{ vars.TRAEFIK_LB_IPV4 || secrets.TRAEFIK_LB_IPV4 || '' }}
 
     steps:
       - name: Checkout
@@ -151,6 +158,112 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  tls-diagnostics-artifact:
+    name: TLS diagnostics artifact (debug)
+    if: ${{ inputs.enable_tls == true && inputs.debug_values == true }}
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 10
+
+    env:
+      TLS_SECRET_NAME: ${{ vars.TLS_SECRET_NAME || secrets.TLS_SECRET_NAME || 'wildcard-tls' }}
+
+      # Wildcard certificate material (recommended names in GH secrets: ELOKO_WILDCARD_CRT / ELOKO_WILDCARD_KEY)
+      # Back-compat fallback: WILDCARD_CRT / WILDCARD_KEY
+      ELOKO_WILDCARD_CRT: ${{ vars.ELOKO_WILDCARD_CRT || secrets.ELOKO_WILDCARD_CRT || '' }}
+      ELOKO_WILDCARD_KEY: ${{ vars.ELOKO_WILDCARD_KEY || secrets.ELOKO_WILDCARD_KEY || '' }}
+      WILDCARD_CRT: ${{ vars.WILDCARD_CRT || secrets.WILDCARD_CRT || '' }}
+      WILDCARD_KEY: ${{ vars.WILDCARD_KEY || secrets.WILDCARD_KEY || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Generate TLS diagnostics (no private key upload)
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          mkdir -p artifacts
+
+          CERT_FILE="artifacts/wildcard.crt"
+          KEY_FILE="artifacts/_wildcard.key"
+
+          # Write PEM material to files without printing to logs.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          crt = (os.environ.get('ELOKO_WILDCARD_CRT') or os.environ.get('WILDCARD_CRT') or '').replace('\r\n', '\n').replace('\r', '')
+          key = (os.environ.get('ELOKO_WILDCARD_KEY') or os.environ.get('WILDCARD_KEY') or '').replace('\r\n', '\n').replace('\r', '')
+
+          Path('artifacts/wildcard.crt').write_text(crt, encoding='utf-8')
+          Path('artifacts/_wildcard.key').write_text(key, encoding='utf-8')
+          PY
+
+          chmod 600 "${CERT_FILE}" "${KEY_FILE}" || true
+
+          {
+            echo "tls_secret_name=${TLS_SECRET_NAME}"
+            echo "cert_bytes=$(wc -c < "${CERT_FILE}" 2>/dev/null || echo 0)"
+            echo "key_bytes=$(wc -c < "${KEY_FILE}" 2>/dev/null || echo 0)"
+            echo "cert_begin_header_present=$(grep -F -q -- '-----BEGIN CERTIFICATE-----' "${CERT_FILE}" && echo true || echo false)"
+            echo "cert_end_footer_present=$(grep -F -q -- '-----END CERTIFICATE-----' "${CERT_FILE}" && echo true || echo false)"
+            echo "key_begin_header_present=$(grep -E -q -- '-----BEGIN (RSA |EC )?PRIVATE KEY-----|-----BEGIN PRIVATE KEY-----' "${KEY_FILE}" && echo true || echo false)"
+            echo "key_end_footer_present=$(grep -E -q -- '-----END (RSA |EC )?PRIVATE KEY-----|-----END PRIVATE KEY-----' "${KEY_FILE}" && echo true || echo false)"
+            echo "cert_pem_blocks=$(grep -c 'BEGIN CERTIFICATE' "${CERT_FILE}" 2>/dev/null || echo 0)"
+            # Detect literal "\n" sequences (common when PEM was pasted as a JSON-escaped string).
+            echo "cert_literal_backslash_n_count=$(grep -o '\\n' "${CERT_FILE}" 2>/dev/null | wc -l || echo 0)"
+            echo "key_literal_backslash_n_count=$(grep -o '\\n' "${KEY_FILE}" 2>/dev/null | wc -l || echo 0)"
+            echo
+            echo "--- cert first/last line (may appear as *** due to GitHub secret masking) ---"
+            head -n 1 "${CERT_FILE}" 2>/dev/null || true
+            tail -n 1 "${CERT_FILE}" 2>/dev/null || true
+            echo
+            echo "--- openssl x509 parse ---"
+            openssl x509 -in "${CERT_FILE}" -noout -subject -issuer -dates -fingerprint -sha256 2>&1 || true
+            echo
+            echo "--- openssl pkey parse (no key output) ---"
+            openssl pkey -in "${KEY_FILE}" -noout -passin pass: 2>&1 || true
+          } > artifacts/tls-diagnostics.txt
+
+          # If the key is parseable, export public key only (safe) and compute a match signal.
+          if openssl pkey -in "${KEY_FILE}" -pubout -out artifacts/wildcard.public.pem -passin pass: 2>/dev/null; then
+            chmod 600 artifacts/wildcard.public.pem || true
+
+            CERT_PUB_HASH="$(openssl x509 -in "${CERT_FILE}" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $2}' || true)"
+            KEY_PUB_HASH="$(openssl pkey -in "${KEY_FILE}" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $2}' || true)"
+
+            {
+              echo "cert_pubkey_sha256=${CERT_PUB_HASH}"
+              echo "key_pubkey_sha256=${KEY_PUB_HASH}"
+              if [[ -n "${CERT_PUB_HASH}" && -n "${KEY_PUB_HASH}" && "${CERT_PUB_HASH}" == "${KEY_PUB_HASH}" ]]; then
+                echo "cert_key_match=true"
+              else
+                echo "cert_key_match=false"
+              fi
+            } > artifacts/tls-match.txt
+          else
+            echo "cert_key_match=unknown" > artifacts/tls-match.txt
+          fi
+
+          # Do NOT leave the private key file in artifacts; keep it only transiently for diagnostics.
+          rm -f "${KEY_FILE}" || true
+
+      - name: Upload TLS diagnostics artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: tls-diagnostics
+          path: |
+            artifacts/tls-diagnostics.txt
+            artifacts/tls-match.txt
+            artifacts/wildcard.crt
+            artifacts/wildcard.public.pem
+          if-no-files-found: warn
+          retention-days: 3
+
   deploy:
     name: Deploy Traefik Ingress
     runs-on: self-hosted
@@ -161,47 +274,45 @@ jobs:
       TRAEFIK_NAMESPACE: traefik
       TRAEFIK_RELEASE: traefik
 
-      # Isolate Azure CLI state to avoid runner-global cache/token issues.
-      AZURE_CONFIG_DIR: /tmp/azcfg
-
       # Isolate kubeconfig to avoid runner-global state.
       KUBECONFIG: /tmp/kubeconfig
 
       # Non-secret defaults from Environment/Repo variables; workflow_dispatch inputs override vars.
-      AKS_RESOURCE_GROUP: ${{ inputs.aks_resource_group || vars.AKS_RESOURCE_GROUP }}
-      AKS_CLUSTER_NAME: ${{ inputs.aks_cluster_name || vars.AKS_CLUSTER_NAME }}
-      TRAEFIK_CHART_VERSION: ${{ inputs.traefik_chart_version || vars.TRAEFIK_CHART_VERSION }}
-      HELM_TIMEOUT: ${{ inputs.helm_timeout || vars.HELM_TIMEOUT }}
+      AKS_RESOURCE_GROUP: ${{ inputs.aks_resource_group || vars.AKS_RESOURCE_GROUP || secrets.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ inputs.aks_cluster_name || vars.AKS_CLUSTER_NAME || secrets.AKS_CLUSTER_NAME }}
+      TRAEFIK_CHART_VERSION: ${{ inputs.traefik_chart_version || vars.TRAEFIK_CHART_VERSION || secrets.TRAEFIK_CHART_VERSION }}
+      HELM_TIMEOUT: ${{ inputs.helm_timeout || vars.HELM_TIMEOUT || secrets.HELM_TIMEOUT }}
 
       ROUTING_MODE: ${{ inputs.routing_mode }}
+      ENABLE_TLS: ${{ inputs.enable_tls }}
       ENABLE_TRAEFIK_DASHBOARD: ${{ inputs.enable_traefik_dashboard }}
       DEBUG_VALUES: ${{ inputs.debug_values }}
 
       # Helm chart repo (Traefik official repo by default)
-      TRAEFIK_HELM_REPO_URL: ${{ vars.TRAEFIK_HELM_REPO_URL || 'https://traefik.github.io/charts' }}
+      TRAEFIK_HELM_REPO_URL: ${{ vars.TRAEFIK_HELM_REPO_URL || secrets.TRAEFIK_HELM_REPO_URL || 'https://traefik.github.io/charts' }}
 
       # Azure SP auth (GHES is private; do not use OIDC federation)
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      DEPLOY_CLIENT_ID: ${{ secrets.DEPLOY_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID || secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID || secrets.AZURE_SUBSCRIPTION_ID }}
+      DEPLOY_CLIENT_ID: ${{ vars.DEPLOY_CLIENT_ID || secrets.DEPLOY_CLIENT_ID }}
       DEPLOY_SECRET: ${{ secrets.DEPLOY_SECRET }}
 
       # Nexus registry credentials (required)
-      REGISTRY_SERVER: ${{ secrets.REGISTRY_SERVER }}
-      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+      REGISTRY_SERVER: ${{ vars.REGISTRY_SERVER || secrets.REGISTRY_SERVER }}
+      REGISTRY_USERNAME: ${{ vars.REGISTRY_USERNAME || secrets.REGISTRY_USERNAME }}
       REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-      IMAGE_PULL_SECRET_NAME: ${{ secrets.IMAGE_PULL_SECRET_NAME }}
+      IMAGE_PULL_SECRET_NAME: ${{ vars.IMAGE_PULL_SECRET_NAME || secrets.IMAGE_PULL_SECRET_NAME }}
 
       # Image override: chart remains traefik/traefik; image repo is Nexus-only (default library/traefik).
-      TRAEFIK_IMAGE_REGISTRY: ${{ vars.TRAEFIK_IMAGE_REGISTRY || secrets.REGISTRY_SERVER }}
-      TRAEFIK_IMAGE_REPOSITORY: ${{ vars.TRAEFIK_IMAGE_REPOSITORY || 'library/traefik' }}
+      TRAEFIK_IMAGE_REGISTRY: ${{ vars.TRAEFIK_IMAGE_REGISTRY || vars.REGISTRY_SERVER || secrets.REGISTRY_SERVER }}
+      TRAEFIK_IMAGE_REPOSITORY: ${{ vars.TRAEFIK_IMAGE_REPOSITORY || secrets.TRAEFIK_IMAGE_REPOSITORY || 'library/traefik' }}
       TRAEFIK_IMAGE_TAG: ${{ vars.TRAEFIK_IMAGE_TAG || '' }}
 
       # In-cluster test image (must be Nexus-hosted) used ONLY when ENABLE_TRAEFIK_DASHBOARD=true
-      TRAEFIK_TEST_IMAGE: ${{ vars.TRAEFIK_TEST_IMAGE || '' }}
+      TRAEFIK_TEST_IMAGE: ${{ vars.TRAEFIK_TEST_IMAGE || secrets.TRAEFIK_TEST_IMAGE || '' }}
 
       # Optional: pin a specific ILB IP (must be free in subnet). If unset, Azure assigns.
-      TRAEFIK_LB_IPV4: ${{ vars.TRAEFIK_LB_IPV4 || '' }}
+      TRAEFIK_LB_IPV4: ${{ vars.TRAEFIK_LB_IPV4 || secrets.TRAEFIK_LB_IPV4 || '' }}
 
       # Optional DNS update (Azure Private DNS)
       DNS_ENABLED: ${{ vars.DNS_ENABLED || secrets.DNS_ENABLED || 'false' }}
@@ -211,13 +322,27 @@ jobs:
       PRIVATE_DNS_A_RECORD_NAME: ${{ vars.PRIVATE_DNS_A_RECORD_NAME || secrets.PRIVATE_DNS_A_RECORD_NAME || '' }}
 
       # Gateway API hardening (namespace selector for allowedRoutes)
-      GATEWAY_ALLOWED_ROUTES_FROM: ${{ vars.GATEWAY_ALLOWED_ROUTES_FROM || 'Selector' }}
-      GATEWAY_ALLOWED_ROUTES_LABEL_KEY: ${{ vars.GATEWAY_ALLOWED_ROUTES_LABEL_KEY || 'traefik-gateway-access' }}
-      GATEWAY_ALLOWED_ROUTES_LABEL_VALUE: ${{ vars.GATEWAY_ALLOWED_ROUTES_LABEL_VALUE || 'enabled' }}
+
+      GATEWAY_ALLOWED_ROUTES_FROM: ${{ vars.GATEWAY_ALLOWED_ROUTES_FROM || secrets.GATEWAY_ALLOWED_ROUTES_FROM || 'Selector' }}
+      GATEWAY_ALLOWED_ROUTES_LABEL_KEY: ${{ vars.GATEWAY_ALLOWED_ROUTES_LABEL_KEY || secrets.GATEWAY_ALLOWED_ROUTES_LABEL_KEY || 'traefik-gateway-access' }}
+      GATEWAY_ALLOWED_ROUTES_LABEL_VALUE: ${{ vars.GATEWAY_ALLOWED_ROUTES_LABEL_VALUE || secrets.GATEWAY_ALLOWED_ROUTES_LABEL_VALUE || 'enabled' }}
 
       # IMPORTANT: Traefik chart entrypoint port for "web" in values.template.yaml is 8000 by default.
       # The Gateway listener port should align to entrypoint port to avoid controller mismatches.
-      GATEWAY_LISTENER_WEB_PORT: ${{ vars.GATEWAY_LISTENER_WEB_PORT || '8000' }}
+      GATEWAY_LISTENER_WEB_PORT: ${{ vars.GATEWAY_LISTENER_WEB_PORT || secrets.GATEWAY_LISTENER_WEB_PORT || '8000' }}
+
+      # TLS (optional)
+      # - For Gateway API, TLS is configured on the Gateway listener (HTTPS) and references a Secret in the traefik namespace.
+      # - For classic Ingress, each app namespace must have its own TLS Secret referenced by the Ingress spec.
+      TLS_SECRET_NAME: ${{ vars.TLS_SECRET_NAME || secrets.TLS_SECRET_NAME || 'wildcard-tls' }}
+      GATEWAY_LISTENER_WEBSECURE_PORT: ${{ vars.GATEWAY_LISTENER_WEBSECURE_PORT || secrets.GATEWAY_LISTENER_WEBSECURE_PORT || '8443' }}
+
+      # Wildcard certificate material (recommended names in GH secrets: ELOKO_WILDCARD_CRT / ELOKO_WILDCARD_KEY)
+      # Back-compat fallback: WILDCARD_CRT / WILDCARD_KEY
+      ELOKO_WILDCARD_CRT: ${{ vars.ELOKO_WILDCARD_CRT || secrets.ELOKO_WILDCARD_CRT || '' }}
+      ELOKO_WILDCARD_KEY: ${{ vars.ELOKO_WILDCARD_KEY || secrets.ELOKO_WILDCARD_KEY || '' }}
+      WILDCARD_CRT: ${{ vars.WILDCARD_CRT || secrets.WILDCARD_CRT || '' }}
+      WILDCARD_KEY: ${{ vars.WILDCARD_KEY || secrets.WILDCARD_KEY || '' }}
 
     steps:
       - name: Checkout
@@ -246,9 +371,8 @@ jobs:
           : "${AZURE_TENANT_ID:?AZURE_TENANT_ID empty}"
           : "${AZURE_SUBSCRIPTION_ID:?AZURE_SUBSCRIPTION_ID empty}"
 
-          # Force non-interactive Azure CLI behaviour by isolating config and clearing any stale context.
-          # This ensures deterministic behaviour on long-lived self-hosted runners.
-          rm -rf "${AZURE_CONFIG_DIR}" 2>/dev/null || true
+          # Force non-interactive Azure CLI behaviour by isolating config and clearing any stale context
+          export AZURE_CONFIG_DIR="/tmp/azcfg"
           mkdir -p "${AZURE_CONFIG_DIR}"
           az logout --output=none 2>/dev/null || true
           az account clear --output=none 2>/dev/null || true
@@ -262,10 +386,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          : "${AKS_RESOURCE_GROUP:?Set inputs.aks_resource_group or vars.AKS_RESOURCE_GROUP}"
-          : "${AKS_CLUSTER_NAME:?Set inputs.aks_cluster_name or vars.AKS_CLUSTER_NAME}"
-          : "${TRAEFIK_CHART_VERSION:?Set inputs.traefik_chart_version or vars.TRAEFIK_CHART_VERSION}"
-          : "${HELM_TIMEOUT:?Set inputs.helm_timeout or vars.HELM_TIMEOUT}"
+          : "${AKS_RESOURCE_GROUP:?Set inputs.aks_resource_group or vars.AKS_RESOURCE_GROUP or secrets.AKS_RESOURCE_GROUP}"
+          : "${AKS_CLUSTER_NAME:?Set inputs.aks_cluster_name or vars.AKS_CLUSTER_NAME or secrets.AKS_CLUSTER_NAME}"
+          : "${TRAEFIK_CHART_VERSION:?Set inputs.traefik_chart_version or vars.TRAEFIK_CHART_VERSION or secrets.TRAEFIK_CHART_VERSION}"
+          : "${HELM_TIMEOUT:?Set inputs.helm_timeout or vars.HELM_TIMEOUT or secrets.HELM_TIMEOUT}"
 
           # Normalise Helm timeout:
           # - If value is purely numeric (e.g. "10"), treat as minutes ("10m")
@@ -301,7 +425,26 @@ jobs:
 
           # Dashboard test image required only when enabled
           if [[ "${ENABLE_TRAEFIK_DASHBOARD}" == "true" ]]; then
-            : "${TRAEFIK_TEST_IMAGE:?Set vars.TRAEFIK_TEST_IMAGE to a Nexus-hosted image containing curl or wget}"
+            : "${TRAEFIK_TEST_IMAGE:?Set vars.TRAEFIK_TEST_IMAGE (or secrets.TRAEFIK_TEST_IMAGE) to a Nexus-hosted image containing curl or wget}"
+          fi
+
+          # TLS material required only when enabled
+          if [[ "${ENABLE_TLS}" == "true" ]]; then
+            : "${TLS_SECRET_NAME:?Set vars.TLS_SECRET_NAME (or secrets.TLS_SECRET_NAME; or accept default 'wildcard-tls')}"
+
+            # Accept back-compat secret names (README: WILDCARD_CRT / WILDCARD_KEY)
+            EFFECTIVE_WILDCARD_CRT="${ELOKO_WILDCARD_CRT:-${WILDCARD_CRT:-}}"
+            EFFECTIVE_WILDCARD_KEY="${ELOKO_WILDCARD_KEY:-${WILDCARD_KEY:-}}"
+
+            : "${EFFECTIVE_WILDCARD_CRT:?Set vars.ELOKO_WILDCARD_CRT (or secrets.ELOKO_WILDCARD_CRT) OR vars.WILDCARD_CRT (or secrets.WILDCARD_CRT) to the PEM certificate/full chain}"
+            : "${EFFECTIVE_WILDCARD_KEY:?Set vars.ELOKO_WILDCARD_KEY (or secrets.ELOKO_WILDCARD_KEY) OR vars.WILDCARD_KEY (or secrets.WILDCARD_KEY) to the PEM private key}"
+
+            if [[ "${ROUTING_MODE}" == "gateway" || "${ROUTING_MODE}" == "both" ]]; then
+              if [[ ! "${GATEWAY_LISTENER_WEBSECURE_PORT}" =~ ^[0-9]+$ ]]; then
+                echo "ERROR: GATEWAY_LISTENER_WEBSECURE_PORT must be numeric. Got: '${GATEWAY_LISTENER_WEBSECURE_PORT}'" >&2
+                exit 1
+              fi
+            fi
           fi
 
       - name: Get AKS credentials (Entra) + kubelogin convert
@@ -334,6 +477,59 @@ jobs:
         run: |
           set -euo pipefail
           kubectl get namespace "${TRAEFIK_NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${TRAEFIK_NAMESPACE}"
+
+      - name: Validate wildcard TLS material + create/update TLS Secret (traefik)
+        if: ${{ inputs.enable_tls == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          CERT_FILE="/tmp/wildcard.crt"
+          KEY_FILE="/tmp/wildcard.key"
+
+          # Write PEM material to files without printing to logs. Accept back-compat names.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          crt = (os.environ.get('ELOKO_WILDCARD_CRT') or os.environ.get('WILDCARD_CRT') or '').replace('\r\n', '\n').replace('\r', '')
+          key = (os.environ.get('ELOKO_WILDCARD_KEY') or os.environ.get('WILDCARD_KEY') or '').replace('\r\n', '\n').replace('\r', '')
+
+          Path('/tmp/wildcard.crt').write_text(crt, encoding='utf-8')
+          Path('/tmp/wildcard.key').write_text(key, encoding='utf-8')
+          PY
+
+          chmod 600 "${CERT_FILE}" "${KEY_FILE}" || true
+
+          if ! grep -F -q -- '-----BEGIN CERTIFICATE-----' "${CERT_FILE}"; then
+            echo "ERROR: Wildcard cert is not PEM (missing 'BEGIN CERTIFICATE' header)." >&2
+            exit 1
+          fi
+          if ! grep -E -q -- '-----BEGIN (RSA |EC )?PRIVATE KEY-----|-----BEGIN PRIVATE KEY-----' "${KEY_FILE}"; then
+            echo "ERROR: Wildcard key is not PEM (missing 'BEGIN ... PRIVATE KEY' header)." >&2
+            exit 1
+          fi
+
+          # Parse checks (do not print sensitive data)
+          openssl x509 -in "${CERT_FILE}" -noout >/dev/null
+          openssl pkey -in "${KEY_FILE}" -noout -passin pass: >/dev/null
+
+          # Confirm cert + key match (public-key hash comparison)
+          CERT_HASH="$(openssl x509 -in "${CERT_FILE}" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 | awk '{print $2}')"
+          KEY_HASH="$(openssl pkey -in "${KEY_FILE}" -pubout -outform DER | openssl dgst -sha256 | awk '{print $2}')"
+          if [[ "${CERT_HASH}" != "${KEY_HASH}" ]]; then
+            echo "ERROR: Wildcard certificate and private key do not match." >&2
+            exit 1
+          fi
+
+          # Create/update the Secret idempotently
+          kubectl --namespace="${TRAEFIK_NAMESPACE}" create secret tls "${TLS_SECRET_NAME}" \
+            --cert="${CERT_FILE}" \
+            --key="${KEY_FILE}" \
+            --dry-run=client -o yaml | kubectl apply --filename=-
+
+          rm -f "${CERT_FILE}" "${KEY_FILE}" || true
 
       - name: Create/update imagePullSecret (Nexus) in Traefik namespace
         shell: bash
@@ -373,15 +569,52 @@ jobs:
 
           chmod 600 /tmp/values.traefik.generated.yaml
 
+      - name: Upload generated values file as artifact (debug)
+        if: ${{ inputs.debug_values == true }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: values-traefik-generated
+          path: /tmp/values.traefik.generated.yaml
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Install/upgrade Traefik (official chart; images pulled from Nexus)
+        id: helm_upgrade
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
 
+          mkdir -p artifacts/helm
+          LOG_FILE="artifacts/helm/helm-upgrade.log"
+
+          # Mirror all command output into an artifact log for post-mortem.
+          exec > >(tee -a "${LOG_FILE}") 2>&1
+
+          echo "=== run-context ==="
+          echo "environment=${{ inputs.environment }}"
+          echo "routing_mode=${ROUTING_MODE}"
+          echo "enable_tls=${ENABLE_TLS}"
+          echo "enable_traefik_dashboard=${ENABLE_TRAEFIK_DASHBOARD}"
+          echo "chart_version=${TRAEFIK_CHART_VERSION}"
+          echo "helm_timeout=${HELM_TIMEOUT}"
+          echo "workflow_ref=${GITHUB_REF}"
+          echo "workflow_sha=${GITHUB_SHA}"
+          echo
+
+          echo "=== helm repo ==="
           helm repo add traefik "${TRAEFIK_HELM_REPO_URL}"
           helm repo update
+          helm repo list
+          echo
+
+          echo "=== upstream chart metadata (for debug artifact) ==="
+          helm show chart traefik/traefik --version="${TRAEFIK_CHART_VERSION}" || true
+          echo
 
           EXTRA_ARGS=()
+          AA_IDX=0
 
           # routing mode toggles
           if [[ "${ROUTING_MODE}" == "ingress" || "${ROUTING_MODE}" == "both" ]]; then
@@ -400,24 +633,64 @@ jobs:
           else
             EXTRA_ARGS+=(--set "providers.kubernetesGateway.enabled=false")
             EXTRA_ARGS+=(--set "gateway.enabled=false")
+
+          fi
+
+          # Optional overrides documented in README
+          if [[ -n "${TRAEFIK_IMAGE_TAG}" ]]; then
+            EXTRA_ARGS+=(--set "image.tag=${TRAEFIK_IMAGE_TAG}")
+          fi
+          if [[ -n "${TRAEFIK_LB_IPV4}" ]]; then
+            EXTRA_ARGS+=(--set "service.spec.loadBalancerIP=${TRAEFIK_LB_IPV4}")
+          fi
+
+          # When TLS is disabled, do not expose the 443 service port (run HTTP-only)
+          if [[ "${ENABLE_TLS}" != "true" ]]; then
+            EXTRA_ARGS+=(--set "ports.websecure.expose.default=false")
+          fi
+
+          # TLS: Option B redirect (HTTP -> HTTPS at entryPoint) when enabled
+          if [[ "${ENABLE_TLS}" == "true" ]]; then
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--entrypoints.web.http.redirections.entryPoint.to=websecure)
+            AA_IDX=$((AA_IDX + 1))
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--entrypoints.web.http.redirections.entryPoint.scheme=https)
+            AA_IDX=$((AA_IDX + 1))
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--entrypoints.web.http.redirections.entryPoint.permanent=true)
+            AA_IDX=$((AA_IDX + 1))
           fi
 
           # enable dashboard/API only when requested (internal-only service check)
           if [[ "${ENABLE_TRAEFIK_DASHBOARD}" == "true" ]]; then
             # Traefik API/dashboard are not served on :8080 unless explicitly exposed.
             # Use CLI flags to expose /api + /dashboard on the internal 'traefik' entryPoint.
-            EXTRA_ARGS+=(--set-string=additionalArguments[0]=--api=true)
-            EXTRA_ARGS+=(--set-string=additionalArguments[1]=--api.dashboard=true)
-            EXTRA_ARGS+=(--set-string=additionalArguments[2]=--api.insecure=true)
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--api=true)
+            AA_IDX=$((AA_IDX + 1))
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--api.dashboard=true)
+            AA_IDX=$((AA_IDX + 1))
+            EXTRA_ARGS+=(--set-string=additionalArguments[${AA_IDX}]=--api.insecure=true)
+            AA_IDX=$((AA_IDX + 1))
           fi
 
-          helm upgrade --install "${TRAEFIK_RELEASE}" traefik/traefik             --namespace="${TRAEFIK_NAMESPACE}"             --version="${TRAEFIK_CHART_VERSION}"             --values="/tmp/values.traefik.generated.yaml"             "${EXTRA_ARGS[@]}"             --wait --atomic --timeout="${HELM_TIMEOUT}"
+          echo "=== helm upgrade --install ==="
+          set +e
+          helm upgrade --install "${TRAEFIK_RELEASE}" traefik/traefik \
+            --namespace="${TRAEFIK_NAMESPACE}" \
+            --version="${TRAEFIK_CHART_VERSION}" \
+            --values="/tmp/values.traefik.generated.yaml" \
+            "${EXTRA_ARGS[@]}" \
+            --wait --atomic --timeout="${HELM_TIMEOUT}"
+          RC=$?
+          set -e
 
-          kubectl --namespace="${TRAEFIK_NAMESPACE}" get pods --output=wide
-          kubectl --namespace="${TRAEFIK_NAMESPACE}" get svc --output=wide
+          echo
+          echo "helm_exit_code=${RC}"
+          echo "helm_exit_code=${RC}" >> "${GITHUB_OUTPUT}"
+
+          # Always exit 0 here (continue-on-error=true); we fail explicitly at the end after uploading debug artifacts.
+          exit 0
 
       - name: Apply Gateway API resources (GatewayClass + Gateway)
-        if: ${{ inputs.routing_mode == 'gateway' || inputs.routing_mode == 'both' }}
+        if: ${{ (inputs.routing_mode == 'gateway' || inputs.routing_mode == 'both') && steps.helm_upgrade.outputs.helm_exit_code == '0' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -425,7 +698,49 @@ jobs:
           # GatewayClass controllerName for Traefik
           # Reference: traefik.io/gateway-controller
           if [[ "${GATEWAY_ALLOWED_ROUTES_FROM}" == "Selector" ]]; then
-            cat <<EOF | kubectl apply --filename=-
+            if [[ "${ENABLE_TLS}" == "true" ]]; then
+              cat <<EOF | kubectl apply --filename=-
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: GatewayClass
+          metadata:
+            name: traefik
+          spec:
+            controllerName: traefik.io/gateway-controller
+          ---
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: traefik
+            namespace: ${TRAEFIK_NAMESPACE}
+          spec:
+            gatewayClassName: traefik
+            listeners:
+              - name: web
+                protocol: HTTP
+                port: ${GATEWAY_LISTENER_WEB_PORT}
+                allowedRoutes:
+                  namespaces:
+                    from: Selector
+                    selector:
+                      matchLabels:
+                        ${GATEWAY_ALLOWED_ROUTES_LABEL_KEY}: "${GATEWAY_ALLOWED_ROUTES_LABEL_VALUE}"
+              - name: websecure
+                protocol: HTTPS
+                port: ${GATEWAY_LISTENER_WEBSECURE_PORT}
+                tls:
+                  mode: Terminate
+                  certificateRefs:
+                    - kind: Secret
+                      name: ${TLS_SECRET_NAME}
+                allowedRoutes:
+                  namespaces:
+                    from: Selector
+                    selector:
+                      matchLabels:
+                        ${GATEWAY_ALLOWED_ROUTES_LABEL_KEY}: "${GATEWAY_ALLOWED_ROUTES_LABEL_VALUE}"
+          EOF
+            else
+              cat <<EOF | kubectl apply --filename=-
           apiVersion: gateway.networking.k8s.io/v1
           kind: GatewayClass
           metadata:
@@ -451,8 +766,45 @@ jobs:
                       matchLabels:
                         ${GATEWAY_ALLOWED_ROUTES_LABEL_KEY}: "${GATEWAY_ALLOWED_ROUTES_LABEL_VALUE}"
           EOF
+            fi
           else
-            cat <<EOF | kubectl apply --filename=-
+            if [[ "${ENABLE_TLS}" == "true" ]]; then
+              cat <<EOF | kubectl apply --filename=-
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: GatewayClass
+          metadata:
+            name: traefik
+          spec:
+            controllerName: traefik.io/gateway-controller
+          ---
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: traefik
+            namespace: ${TRAEFIK_NAMESPACE}
+          spec:
+            gatewayClassName: traefik
+            listeners:
+              - name: web
+                protocol: HTTP
+                port: ${GATEWAY_LISTENER_WEB_PORT}
+                allowedRoutes:
+                  namespaces:
+                    from: ${GATEWAY_ALLOWED_ROUTES_FROM}
+              - name: websecure
+                protocol: HTTPS
+                port: ${GATEWAY_LISTENER_WEBSECURE_PORT}
+                tls:
+                  mode: Terminate
+                  certificateRefs:
+                    - kind: Secret
+                      name: ${TLS_SECRET_NAME}
+                allowedRoutes:
+                  namespaces:
+                    from: ${GATEWAY_ALLOWED_ROUTES_FROM}
+          EOF
+            else
+              cat <<EOF | kubectl apply --filename=-
           apiVersion: gateway.networking.k8s.io/v1
           kind: GatewayClass
           metadata:
@@ -475,11 +827,13 @@ jobs:
                   namespaces:
                     from: ${GATEWAY_ALLOWED_ROUTES_FROM}
           EOF
+            fi
           fi
 
           kubectl --namespace="${TRAEFIK_NAMESPACE}" get gateway traefik --output=yaml
 
       - name: Post-deployment checks (internal readiness + ILB IP)
+        if: ${{ steps.helm_upgrade.outputs.helm_exit_code == '0' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -500,11 +854,13 @@ jobs:
           echo "TRAEFIK_ILB_IP=${ILB_IP}" >> "${GITHUB_ENV}"
 
       - name: Create internal dashboard service (ClusterIP, port 8080)
-        if: ${{ inputs.enable_traefik_dashboard == true }}
+        if: ${{ inputs.enable_traefik_dashboard == true && steps.helm_upgrade.outputs.helm_exit_code == '0' }}
+
         shell: bash
         run: |
           set -euo pipefail
           umask 077
+
 
           # We select the Traefik pods using standard Helm labels.
           # Chart instance label pattern for this release is: ${TRAEFIK_RELEASE}-traefik
@@ -530,12 +886,12 @@ jobs:
 
           kubectl --namespace="${TRAEFIK_NAMESPACE}" get svc traefik-dashboard --output=wide
       - name: "Post-deploy check: Traefik dashboard/API (port-forward -> /api/version)"
-        if: ${{ inputs.enable_traefik_dashboard == true }}
+        if: ${{ inputs.enable_traefik_dashboard == true && steps.helm_upgrade.outputs.helm_exit_code == '0' }}
         shell: bash
         run: |
           set -euo pipefail
           NS="${TRAEFIK_NAMESPACE}"
-          : "${TRAEFIK_TEST_IMAGE:?vars.TRAEFIK_TEST_IMAGE must be set when enable_traefik_dashboard=true}"
+          : "${TRAEFIK_TEST_IMAGE:?vars.TRAEFIK_TEST_IMAGE (or secrets.TRAEFIK_TEST_IMAGE) must be set when enable_traefik_dashboard=true}"
 
           JOB_NAME="traefik-api-check"
 
@@ -596,7 +952,7 @@ jobs:
           kubectl --namespace="${NS}" delete job "${JOB_NAME}" --ignore-not-found=true
 
       - name: "Optional: Update Azure Private DNS A record (ingress-traefik -> ILB IP)"
-        if: ${{ env.DNS_ENABLED == 'true' }}
+        if: ${{ env.DNS_ENABLED == 'true' && steps.helm_upgrade.outputs.helm_exit_code == '0' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -604,6 +960,8 @@ jobs:
           : "${PRIVATE_DNS_ZONE_SUBSCRIPTION_ID:?PRIVATE_DNS_ZONE_SUBSCRIPTION_ID missing}"
           : "${PRIVATE_DNS_ZONE_RESOURCE_GROUP:?PRIVATE_DNS_ZONE_RESOURCE_GROUP missing}"
           : "${PRIVATE_DNS_ZONE_NAME:?PRIVATE_DNS_ZONE_NAME missing}"
+
+          : "${PRIVATE_DNS_A_RECORD_NAME:?PRIVATE_DNS_A_RECORD_NAME missing}"
 
           ILB_IP="${{env.TRAEFIK_ILB_IP}}"
           : "${ILB_IP:?Failed to read ILB IP from service}"
@@ -613,14 +971,19 @@ jobs:
           : "${AZURE_TENANT_ID:?AZURE_TENANT_ID empty}"
           : "${AZURE_SUBSCRIPTION_ID:?AZURE_SUBSCRIPTION_ID empty}"
 
-          # Re-login here to ensure Azure CLI has a fresh, valid context
-          # before switching subscription for cross-subscription DNS updates.
+          # Force non-interactive Azure CLI behaviour by isolating config and clearing any stale context
+          export AZURE_CONFIG_DIR="/tmp/azcfg"
+          mkdir -p "${AZURE_CONFIG_DIR}"
+          az logout --output=none 2>/dev/null || true
+          az account clear --output=none 2>/dev/null || true
+
           az login \
-            --service-principal \
-            --username="${DEPLOY_CLIENT_ID}" \
-            --password="${DEPLOY_SECRET}" \
-            --tenant="${AZURE_TENANT_ID}" \
-            --output=none
+          --service-principal \
+          --username="${DEPLOY_CLIENT_ID}" \
+          --password="${DEPLOY_SECRET}" \
+          --tenant="${AZURE_TENANT_ID}" \
+          --output=none
+
           az account set --subscription="${PRIVATE_DNS_ZONE_SUBSCRIPTION_ID}"
 
           echo "Checking for existing A record-set '${PRIVATE_DNS_A_RECORD_NAME}' in zone '${PRIVATE_DNS_ZONE_NAME}'..."
@@ -678,3 +1041,111 @@ jobs:
             --only-show-errors
             
           echo "Updated Private DNS: ${PRIVATE_DNS_A_RECORD_NAME}.${PRIVATE_DNS_ZONE_NAME} -> ${ILB_IP}"
+
+      - name: Collect deploy debug artifacts (helm chart + kubectl snapshot)
+        if: ${{ always() && inputs.debug_values == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          ROOT="artifacts/deploy-debug"
+          mkdir -p "${ROOT}/helm" "${ROOT}/kubectl" "${ROOT}/runtime"
+
+          # Copy generated values (non-secret material) if present.
+          if [[ -f /tmp/values.traefik.generated.yaml ]]; then
+            cp /tmp/values.traefik.generated.yaml "${ROOT}/values.traefik.generated.yaml"
+            chmod 600 "${ROOT}/values.traefik.generated.yaml" || true
+          fi
+
+          # Carry forward helm upgrade log (if the helm step ran).
+          if [[ -f artifacts/helm/helm-upgrade.log ]]; then
+            cp artifacts/helm/helm-upgrade.log "${ROOT}/helm/helm-upgrade.log"
+          fi
+
+          {
+            echo "date_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ' || true)"
+            echo "environment=${{ inputs.environment }}"
+            echo "routing_mode=${{ inputs.routing_mode }}"
+            echo "enable_tls=${{ inputs.enable_tls }}"
+            echo "enable_traefik_dashboard=${{ inputs.enable_traefik_dashboard }}"
+            echo "chart_version=${TRAEFIK_CHART_VERSION}"
+            echo "helm_timeout=${HELM_TIMEOUT}"
+            echo "workflow_ref=${GITHUB_REF}"
+            echo "workflow_sha=${GITHUB_SHA}"
+            echo "helm_exit_code=${{ steps.helm_upgrade.outputs.helm_exit_code }}"
+          } > "${ROOT}/runtime/run-context.txt"
+
+          {
+            echo "=== az version ==="
+            az version 2>/dev/null || true
+            echo
+            echo "=== kubectl version (client) ==="
+            kubectl version --client=true 2>/dev/null || true
+            echo
+            echo "=== helm version ==="
+            helm version 2>/dev/null || true
+            echo
+            echo "=== kubelogin version ==="
+            kubelogin --version 2>/dev/null || true
+            echo
+            echo "=== openssl version ==="
+            openssl version 2>/dev/null || true
+          } > "${ROOT}/runtime/tool-versions.txt" 2>&1 || true
+
+          # Upstream chart metadata (no cluster required).
+          helm repo add traefik "${TRAEFIK_HELM_REPO_URL}" 2>/dev/null || true
+          helm repo update 2>/dev/null || true
+
+          {
+            echo "=== helm repo list ==="
+            helm repo list || true
+            echo
+            echo "=== helm show chart traefik/traefik --version ${TRAEFIK_CHART_VERSION} ==="
+            helm show chart traefik/traefik --version="${TRAEFIK_CHART_VERSION}" || true
+          } > "${ROOT}/helm/chart.txt" 2>&1 || true
+
+          helm show values traefik/traefik --version="${TRAEFIK_CHART_VERSION}" > "${ROOT}/helm/upstream-values.yaml" 2>&1 || true
+          helm pull traefik/traefik --version="${TRAEFIK_CHART_VERSION}" --destination "${ROOT}/helm" > "${ROOT}/helm/helm-pull.txt" 2>&1 || true
+
+
+          # Release-level data (best-effort; requires cluster access).
+          helm --namespace="${TRAEFIK_NAMESPACE}" list > "${ROOT}/helm/helm-list.txt" 2>&1 || true
+          helm --namespace="${TRAEFIK_NAMESPACE}" status "${TRAEFIK_RELEASE}" > "${ROOT}/helm/helm-status.txt" 2>&1 || true
+          helm --namespace="${TRAEFIK_NAMESPACE}" history "${TRAEFIK_RELEASE}" > "${ROOT}/helm/helm-history.txt" 2>&1 || true
+          helm --namespace="${TRAEFIK_NAMESPACE}" get values "${TRAEFIK_RELEASE}" --all > "${ROOT}/helm/helm-get-values.yaml" 2>&1 || true
+          helm --namespace="${TRAEFIK_NAMESPACE}" get manifest "${TRAEFIK_RELEASE}" > "${ROOT}/helm/helm-get-manifest.yaml" 2>&1 || true
+
+          # Kubernetes snapshot (best-effort; avoid exporting Secrets).
+          kubectl --namespace="${TRAEFIK_NAMESPACE}" get all --output=wide > "${ROOT}/kubectl/get-all.txt" 2>&1 || true
+          kubectl --namespace="${TRAEFIK_NAMESPACE}" get svc --output=wide > "${ROOT}/kubectl/get-svc.txt" 2>&1 || true
+          kubectl --namespace="${TRAEFIK_NAMESPACE}" get pods --output=wide > "${ROOT}/kubectl/get-pods.txt" 2>&1 || true
+          kubectl --namespace="${TRAEFIK_NAMESPACE}" get events --sort-by=.lastTimestamp > "${ROOT}/kubectl/get-events.txt" 2>&1 || true
+          kubectl --namespace="${TRAEFIK_NAMESPACE}" describe deploy --selector="app.kubernetes.io/name=traefik" > "${ROOT}/kubectl/describe-deploy.txt" 2>&1 || true
+          kubectl --namespace="${TRAEFIK_NAMESPACE}" describe svc "${TRAEFIK_RELEASE}" > "${ROOT}/kubectl/describe-svc.txt" 2>&1 || true
+
+          # Pod logs for Traefik (all containers).
+          PODS="$(kubectl --namespace="${TRAEFIK_NAMESPACE}" get pods -l app.kubernetes.io/name=traefik -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+          if [[ -n "${PODS}" ]]; then
+            while IFS= read -r p; do
+              [[ -z "${p}" ]] && continue
+              kubectl --namespace="${TRAEFIK_NAMESPACE}" logs "${p}" --all-containers=true > "${ROOT}/kubectl/logs-${p}.txt" 2>&1 || true
+            done <<< "${PODS}"
+          fi
+
+      - name: Upload deploy debug artifact (helm chart + logs)
+        if: ${{ always() && inputs.debug_values == true }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: traefik-deploy-debug
+          path: artifacts/deploy-debug
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Fail if Helm deployment failed
+        if: ${{ steps.helm_upgrade.outputs.helm_exit_code != '' && steps.helm_upgrade.outputs.helm_exit_code != '0' }}
+        shell: bash
+        run: |
+          echo "ERROR: Helm deployment failed (exit code ${{ steps.helm_upgrade.outputs.helm_exit_code }}). See artifact 'traefik-deploy-debug'." >&2
+          exit 1
+

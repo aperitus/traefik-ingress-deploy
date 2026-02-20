@@ -20,6 +20,19 @@ You can run **both** modes during migration.
 
 Run the GitHub Action: **Deploy Traefik Ingress (AKS)**.
 
+
+### Value precedence (vars-first)
+
+For **non-sensitive** configuration values, the workflow resolves inputs in this order:
+
+1) `workflow_dispatch` inputs (when provided)
+2) Environment **vars** (`vars.*`)
+3) Environment **secrets** (`secrets.*`) as a compatibility fallback
+
+Sensitive material (e.g., `DEPLOY_SECRET`, `REGISTRY_PASSWORD`, wildcard TLS key/cert) must remain in **secrets**.
+
+See `variables.md` for a full list of inputs, vars, and secrets.
+
 ### Required vars (per GH Environment)
 
 - `AKS_RESOURCE_GROUP`
@@ -33,9 +46,14 @@ Run the GitHub Action: **Deploy Traefik Ingress (AKS)**.
 
 ### Required secrets (per GH Environment)
 
-- Azure: `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `DEPLOY_CLIENT_ID`, `DEPLOY_SECRET`
-- Nexus registry auth: `REGISTRY_SERVER`, `REGISTRY_USERNAME`, `REGISTRY_PASSWORD`, `IMAGE_PULL_SECRET_NAME`
+
+- Azure: `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `DEPLOY_CLIENT_ID` (vars preferred; secrets supported), and `DEPLOY_SECRET` (secret)
+- Nexus registry auth: `REGISTRY_PASSWORD` (secret) and (vars preferred; secrets supported) `REGISTRY_SERVER`, `REGISTRY_USERNAME`, `IMAGE_PULL_SECRET_NAME`
 - Optional DNS: `DNS_ENABLED`, `PRIVATE_DNS_ZONE_*`
+- TLS (enabled by default; set workflow input `enable_tls=false` to run without TLS):
+  - `ELOKO_WILDCARD_CRT` (PEM certificate / full chain)
+  - `ELOKO_WILDCARD_KEY` (PEM private key)
+  - Back-compat fallback names are also accepted: `WILDCARD_CRT` / `WILDCARD_KEY`
 
 
 ### Runner prerequisites
@@ -83,6 +101,91 @@ Ingress mode is less opinionated; you should enforce:
 
 See: `docs/onboarding-ingress.md`
 
+
+## TLS enablement (wildcard certificate)
+
+This repo can configure TLS on the Traefik data-plane using a wildcard certificate stored in GitHub Environment secrets. TLS is **enabled by default** (`enable_tls=true`).
+
+### What the workflow does when TLS is enabled
+
+When you run the workflow with `enable_tls=true` (default):
+
+- it creates/updates a Kubernetes TLS Secret in the `traefik` namespace (default name: `wildcard-tls`)
+- it adds an **HTTPS** listener (`websecure`) to the shared `Gateway` (Gateway API mode) that references that Secret
+- it enforces **Option B**: keep HTTP open but redirect **HTTP → HTTPS** at the Traefik entrypoint (`web` → `websecure`)
+
+### Configure inputs/vars
+
+1) Store your wildcard material as Environment secrets (recommended names):
+   - `ELOKO_WILDCARD_CRT` (PEM certificate; include full chain)
+   - `ELOKO_WILDCARD_KEY` (PEM private key)
+
+2) Optional Environment vars:
+   - `TLS_SECRET_NAME` (default: `wildcard-tls`)
+   - `GATEWAY_LISTENER_WEBSECURE_PORT` (default: `8443`)
+
+### Validating the wildcard certificate secrets
+
+The error `tls: failed to find any PEM data in certificate input` almost always means your secret is **not raw PEM**.
+
+Requirements:
+- `ELOKO_WILDCARD_CRT` must contain one or more PEM certificate blocks (starts with `-----BEGIN CERTIFICATE-----`).
+- `ELOKO_WILDCARD_KEY` must contain an unencrypted PEM private key (starts with `-----BEGIN ... PRIVATE KEY-----`).
+
+Local (safe) checks (these do **not** print the private key):
+
+```bash
+# Certificate parses and shows minimal metadata
+openssl x509 -in wildcard.crt -noout -subject -issuer -dates -fingerprint -sha256
+
+# Key parses non-interactively (fails fast if encrypted / wrong format)
+openssl pkey -in wildcard.key -noout -passin pass:
+
+# Confirm cert+key match (RSA/ECDSA): compare public-key hashes
+cert_hash=$(openssl x509 -in wildcard.crt -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 | awk '{print $2}')
+key_hash=$(openssl pkey -in wildcard.key -pubout -outform DER | openssl dgst -sha256 | awk '{print $2}')
+test "$cert_hash" = "$key_hash" && echo "MATCH" || echo "MISMATCH"
+
+# Count certificate blocks (should be >= 1; full chain often has 2+)
+grep -c 'BEGIN CERTIFICATE' wildcard.crt
+```
+
+If you have a PFX/PKCS#12 instead of PEM, convert it first:
+
+```bash
+openssl pkcs12 -in wildcard.pfx -clcerts -nokeys -out wildcard.crt
+openssl pkcs12 -in wildcard.pfx -nocerts -nodes -out wildcard.key
+```
+
+The workflow also performs these validations (PEM marker checks + `openssl` parse + keypair match) before creating the Kubernetes TLS Secret.
+
+### Debugging certificate handling in the workflow
+
+If you suspect the runner-written temp files are malformed (line endings, literal `\n`, truncation), run the workflow with:
+
+- `debug_values=true`
+
+This triggers separate debug jobs that upload:
+- `wildcard.crt` (certificate / full chain)
+- `wildcard.public.pem` (public key derived from the private key)
+- `tls-diagnostics.txt` / `tls-match.txt`
+
+It also uploads:
+- `values.traefik.generated.yaml` (safe: contains no secrets)
+- `traefik-deploy-debug` (helm chart metadata, helm upgrade log, release manifests, and kubectl snapshot/logs; best-effort, no Secrets exported)
+
+The private key is **never** uploaded.
+
+### Notes by routing model
+
+- **Gateway API**: TLS is configured once on the shared Gateway listener; application `HTTPRoute` resources do not need to carry per-app certificates.
+- **Kubernetes Ingress**: the referenced TLS Secret must exist **in the same namespace as the Ingress**. The Secret created by this repo in `traefik` is not automatically available in application namespaces.
+  - If you create HTTP-only Ingress resources (no `spec.tls`), the platform-wide HTTP→HTTPS redirect will send clients to HTTPS where no router exists, typically resulting in `404` or a TLS mismatch. Treat TLS on Ingress as mandatory when `enable_tls=true`.
+
+See also:
+- `docs/onboarding-gateway-api.md` (Gateway API)
+- `docs/onboarding-ingress.md` (Ingress)
+
 ## Dashboard testing
 
 By default, the dashboard/API is not exposed on the data-plane. For dev-only validation:
@@ -92,10 +195,56 @@ By default, the dashboard/API is not exposed on the data-plane. For dev-only val
 Manual (operator) check:
 - `kubectl -n traefik port-forward svc/traefik-dashboard 8080:8080` then browse `http://127.0.0.1:8080/dashboard/`
 
-## Azure permissions notes
+## Additional configuration (Azure RBAC)
 
-- **Internal LB provisioning**: AKS managed identity must be able to read subnet/VNet and manage load balancers (you observed `subnets/read` 403 until granting).
-- **Private DNS updates (cross-subscription)**: the deploy SP needs `Private DNS Zone Contributor` (or Contributor) on the target zone or RG.
+This deployment touches **two different identities**. Assign Azure RBAC to the identity that performs the action:
+
+1) **AKS cluster identity** (managed identity recommended)
+   - Used by the AKS cloud provider to provision/maintain Azure Load Balancer resources for Kubernetes `Service` objects of type `LoadBalancer`.
+
+2) **Deployment service principal** (this workflow)
+   - Used for Azure login, fetching AKS credentials, and (optionally) writing Private DNS records.
+
+### Network Contributor (AKS cluster identity)
+
+To provision an **internal** Azure Load Balancer (ILB) onto your target VNet/subnet, the **AKS cluster identity** must have:
+
+- Role: **Network Contributor**
+- Scope: the **subnet** where the ILB is created (preferred), or VNet scope if you cannot scope to subnet.
+
+Example (subnet scope; system-assigned MI):
+
+```bash
+AKS_PRINCIPAL_ID=$(az aks show -g <AKS_RESOURCE_GROUP> -n <AKS_CLUSTER_NAME> --query identity.principalId -o tsv)
+
+az role assignment create \
+  --assignee-object-id "$AKS_PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Network Contributor" \
+  --scope "/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<VNET_RG>/providers/Microsoft.Network/virtualNetworks/<VNET_NAME>/subnets/<SUBNET_NAME>"
+```
+
+If your AKS uses a legacy service principal identity, apply the same role to that SPN object ID instead.
+
+### Private DNS Zone Contributor (deployment service principal; optional)
+
+When `DNS_ENABLED=true`, the workflow creates/updates a Private DNS **A record** using Azure CLI. That operation is performed by the **deployment service principal** (`DEPLOY_CLIENT_ID`/`DEPLOY_SECRET`).
+
+- Role: **Private DNS Zone Contributor**
+- Scope: the Private DNS **zone resource** (preferred) or its resource group
+- Cross-subscription zones are supported, but the role assignment must exist in the subscription that hosts the zone.
+
+Example (zone scope):
+
+```bash
+DEPLOY_SPN_OBJECT_ID=$(az ad sp show --id <DEPLOY_CLIENT_ID> --query id -o tsv)
+
+az role assignment create \
+  --assignee-object-id "$DEPLOY_SPN_OBJECT_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Private DNS Zone Contributor" \
+  --scope "/subscriptions/<DNS_SUBSCRIPTION_ID>/resourceGroups/<DNS_RG>/providers/Microsoft.Network/privateDnsZones/<PRIVATE_DNS_ZONE_NAME>"
+```
 
 ## Next steps
 

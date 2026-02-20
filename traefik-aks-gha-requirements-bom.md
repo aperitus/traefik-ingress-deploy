@@ -20,6 +20,8 @@ This repo deploys **Traefik** to an **Entra-enabled AKS** cluster using **GitHub
   - `helm upgrade --install --wait --atomic --timeout ...` with **pinned chart version**.
   - Namespace and secrets created with `kubectl apply` patterns.
 - Never print secret material to logs. Generated values are written under `/tmp` with restrictive permissions.
+- Debug artifacts are uploaded with `actions/upload-artifact@v3`.
+
 
 ## Targets
 
@@ -31,12 +33,26 @@ This repo deploys **Traefik** to an **Entra-enabled AKS** cluster using **GitHub
 
 ## Inputs / Variables / Secrets
 
+
+**Value precedence (vars-first):** For non-sensitive config, the workflow resolves values in this order:
+
+1) Workflow dispatch inputs (`workflow_dispatch`)
+2) Environment/repository variables (`vars.*`)
+3) Environment/repository secrets (`secrets.*`) as a compatibility fallback
+
+
+
 ### Workflow inputs (dispatch)
 
 - `environment`: `dev|preprod|prod`
 - `routing_mode`: `gateway|ingress|both` (default: `both`)
-- `debug_values`: upload rendered values file as artifact (safe; implemented as a separate job so it still appears even when the deploy job fails)
+- `debug_values`: upload debug artifacts (vars/rendered values + TLS diagnostics) and also collect best-effort deploy diagnostics (helm chart metadata/logs + kubectl snapshot) so you can troubleshoot failed runs without rerunning:
+  - `values.traefik.generated.yaml` (safe; contains no secrets)
+  - `traefik-deploy-debug` (helm chart metadata, helm upgrade log, release manifests, kubectl snapshot + pod logs; no Secrets exported)
+  - if `enable_tls=true`, TLS diagnostics (certificate + derived public key only; never uploads private key)
 - `enable_traefik_dashboard`: dev-only enable of Traefik API/dashboard (validated internally)
+- `enable_tls`: enable TLS on the data-plane using a wildcard certificate stored in GitHub secrets (default: true). When enabled, enforce **Option B**: keep HTTP open but redirect **HTTP → HTTPS** (`web` → `websecure`).
+
 
 ### Repository/Environment variables (vars)
 
@@ -54,16 +70,29 @@ This repo deploys **Traefik** to an **Entra-enabled AKS** cluster using **GitHub
   - `GATEWAY_ALLOWED_ROUTES_LABEL_VALUE` (default `enabled`)
     - **Must be a string** (avoid values like `true`, `false`, `yes`, `no`, `on`, `off`, `null`, `0`, `1`)
 
+- **TLS** (used when `enable_tls=true`, which is the default):
+  - `TLS_SECRET_NAME` (default `wildcard-tls`)
+  - `GATEWAY_LISTENER_WEBSECURE_PORT` (default `8443`)
+
 ### Secrets (Environment secrets)
 
-- `AZURE_TENANT_ID`
-- `AZURE_SUBSCRIPTION_ID`
-- `DEPLOY_CLIENT_ID`
-- `DEPLOY_SECRET`
-- `REGISTRY_SERVER`
-- `REGISTRY_USERNAME`
-- `REGISTRY_PASSWORD`
-- `IMAGE_PULL_SECRET_NAME`
+- Azure:
+  - `DEPLOY_SECRET` (required secret)
+  - `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `DEPLOY_CLIENT_ID` (vars preferred; secrets supported)
+- Nexus registry auth:
+  - `REGISTRY_PASSWORD` (required secret)
+  - `REGISTRY_SERVER`, `REGISTRY_USERNAME`, `IMAGE_PULL_SECRET_NAME` (vars preferred; secrets supported)
+- TLS (required by default; set workflow input `enable_tls=false` to run without TLS):
+  - `ELOKO_WILDCARD_CRT` (PEM certificate / full chain)
+  - `ELOKO_WILDCARD_KEY` (PEM private key)
+  - Back-compat fallback names are also accepted: `WILDCARD_CRT` / `WILDCARD_KEY`
+  - Notes:
+    - Store **raw PEM** (must include `-----BEGIN ...-----` markers). Do not base64-encode the PEM and do not paste PFX/DER content.
+    - Workflow performs PEM marker checks + `openssl` parse + cert/key match before creating the Kubernetes TLS Secret.
+    - If troubleshooting TLS material handling, run the workflow with `debug_values=true`:
+      - Uploads `wildcard.crt` (certificate/full-chain only) and a derived `wildcard.public.pem` (public key) plus `tls-diagnostics.txt`.
+      - **Never uploads the private key.**
+
 - DNS (optional):
   - `DNS_ENABLED` (`true|false`)
   - `PRIVATE_DNS_ZONE_SUBSCRIPTION_ID`

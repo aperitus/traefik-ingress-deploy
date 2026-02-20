@@ -44,11 +44,27 @@ Routing mode is selected by workflow input `routing_mode`.
 
 **Default routing mode**: `both`.
 
-## Access control guidance
-
 - Prefer Gateway mode with `GATEWAY_ALLOWED_ROUTES_FROM=Selector` and onboard namespaces by label.
 - Gateway selector label values are **strings**; avoid boolean-like values (`true/false/yes/no/on/off/null`) or pure numbers.
 - If Ingress mode is used, require explicit `ingressClassName=traefik` and enforce hostname/TLS rules via policy where possible.
+
+## TLS enablement
+
+The repo must support enabling TLS on the Traefik data-plane using a wildcard certificate stored in GitHub Environment secrets.
+
+- Workflow input `enable_tls=true` enables TLS support and is the **default**.
+- When enabled:
+  - Create/update a Kubernetes TLS Secret in the `traefik` namespace (name from `vars.TLS_SECRET_NAME`, default `wildcard-tls`).
+  - Add an HTTPS listener (`websecure`) to the shared Gateway (Gateway API modes) referencing that Secret via `certificateRefs`.
+  - HTTPS listener port is set by `vars.GATEWAY_LISTENER_WEBSECURE_PORT` (default `8443`).
+  - Enforce **Option B**: keep HTTP open but redirect **HTTP → HTTPS** at the Traefik entrypoint (`web` → `websecure`) whenever TLS is enabled.
+- Certificate material is sourced from secrets:
+  - Preferred: `ELOKO_WILDCARD_CRT` / `ELOKO_WILDCARD_KEY`
+  - Back-compat fallback: `WILDCARD_CRT` / `WILDCARD_KEY`
+- Secrets must be **raw PEM** including `-----BEGIN ...-----` markers (not base64, not PFX/DER). Validate before attempting Kubernetes secret creation.
+- Workflow must validate: PEM markers present, `openssl` can parse cert/key non-interactively, and cert/key match.
+- Never print cert/key to logs.
+- Note: Kubernetes Ingress still requires the TLS Secret to exist in the *same namespace as the Ingress*.
 
 ## Post-deploy checks
 
@@ -62,9 +78,18 @@ Routing mode is selected by workflow input `routing_mode`.
 
 - If `debug_values=true`, render and upload the generated values file as a workflow artifact.
 - The artifact upload should be performed in a **separate job** (not as a step within the deployment job) so it still appears even when the deployment job fails.
+- If `debug_values=true` and `enable_tls=true`, upload TLS diagnostics as a workflow artifact (also as a separate job):
+  - Upload the certificate file (`wildcard.crt`) and a derived public key (`wildcard.public.pem`) plus diagnostic text.
+  - **Never upload the private key.**
+
 
 ## DNS update
 
 If `DNS_ENABLED=true`, update a Private DNS A record (possibly in another subscription). Document required Azure roles for:
 - AKS managed identity (ILB provisioning)
 - Deploy SP (Private DNS Zone Contributor)
+
+## Debug artifacts
+
+When `debug_values=true`, ensure debug artifacts include: rendered values, TLS diagnostics (no private key), and deploy diagnostics (`traefik-deploy-debug`) containing helm chart metadata/logs and a kubectl snapshot (no Secrets exported).
+

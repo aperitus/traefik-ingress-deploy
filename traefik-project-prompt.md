@@ -44,8 +44,6 @@ Routing mode is selected by workflow input `routing_mode`.
 
 **Default routing mode**: `both`.
 
-## Access control guidance
-
 - Prefer Gateway mode with `GATEWAY_ALLOWED_ROUTES_FROM=Selector` and onboard namespaces by label.
 - Gateway selector label values are **strings**; avoid boolean-like values (`true/false/yes/no/on/off/null`) or pure numbers.
 - If Ingress mode is used, require explicit `ingressClassName=traefik` and enforce hostname/TLS rules via policy where possible.
@@ -84,8 +82,14 @@ The repo must support enabling TLS on the Traefik data-plane using a wildcard ce
   - Upload the certificate file (`wildcard.crt`) and a derived public key (`wildcard.public.pem`) plus diagnostic text.
   - **Never upload the private key.**
 
+
 ## DNS update
 
 If `DNS_ENABLED=true`, update a Private DNS A record (possibly in another subscription). Document required Azure roles for:
 - AKS managed identity (ILB provisioning)
 - Deploy SP (Private DNS Zone Contributor)
+
+## Debug artifacts
+
+When `debug_values=true`, ensure debug artifacts include: rendered values, TLS diagnostics (no private key), and deploy diagnostics (`traefik-deploy-debug`) containing helm chart metadata/logs and a kubectl snapshot (no Secrets exported).
+

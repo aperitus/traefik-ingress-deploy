@@ -30,6 +30,7 @@ kubectl -n myapp create secret tls wildcard-tls \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
+
 ## Minimal Ingress example
 
 ```yaml
@@ -82,6 +83,7 @@ If you later migrate to Gateway API, keep the app’s Service as-is; replace the
 If the platform Gateway is configured with `namespacePolicy.from: Selector`, your app namespace must carry the label **as a string**:
 
 ```bash
+
 kubectl label namespace <your-namespace> traefik-gateway-access=enabled --overwrite
 ```
 

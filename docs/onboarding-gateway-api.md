@@ -90,6 +90,7 @@ kubectl -n traefik get gateway traefik -o yaml
 > Some Gateway API controllers require binding an `HTTPRoute` to a specific listener via `parentRefs[].sectionName`.
 > If required, set `sectionName: websecure` on the parentRef.
 
+
 ## Controlling access
 
 - **Most restrictive:** `Same` — only routes in the `traefik` namespace attach (usually too restrictive).
@@ -100,8 +101,10 @@ This is the core control that makes Gateway API attractive for shared ingress pl
 
 
 ### Dashboard/API verification (internal-only)
+
 The deployment workflow can enable Traefik's internal API/dashboard on the admin entrypoint by setting `enable_traefik_dashboard=true`.
 
 Validation is performed internally by creating a `traefik-dashboard` **ClusterIP** Service and running an **in-cluster Job** that calls `http://traefik-dashboard:8080/api/version` using a Nexus-hosted test image (must include `curl` or `wget`).
 
 Use this only for internal/dev validation and do not expose it externally without authentication.
+

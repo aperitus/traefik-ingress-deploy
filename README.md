@@ -20,6 +20,19 @@ You can run **both** modes during migration.
 
 Run the GitHub Action: **Deploy Traefik Ingress (AKS)**.
 
+
+### Value precedence (vars-first)
+
+For **non-sensitive** configuration values, the workflow resolves inputs in this order:
+
+1) `workflow_dispatch` inputs (when provided)
+2) Environment **vars** (`vars.*`)
+3) Environment **secrets** (`secrets.*`) as a compatibility fallback
+
+Sensitive material (e.g., `DEPLOY_SECRET`, `REGISTRY_PASSWORD`, wildcard TLS key/cert) must remain in **secrets**.
+
+See `variables.md` for a full list of inputs, vars, and secrets.
+
 ### Required vars (per GH Environment)
 
 - `AKS_RESOURCE_GROUP`
@@ -33,8 +46,9 @@ Run the GitHub Action: **Deploy Traefik Ingress (AKS)**.
 
 ### Required secrets (per GH Environment)
 
-- Azure: `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `DEPLOY_CLIENT_ID`, `DEPLOY_SECRET`
-- Nexus registry auth: `REGISTRY_SERVER`, `REGISTRY_USERNAME`, `REGISTRY_PASSWORD`, `IMAGE_PULL_SECRET_NAME`
+
+- Azure: `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `DEPLOY_CLIENT_ID` (vars preferred; secrets supported), and `DEPLOY_SECRET` (secret)
+- Nexus registry auth: `REGISTRY_PASSWORD` (secret) and (vars preferred; secrets supported) `REGISTRY_SERVER`, `REGISTRY_USERNAME`, `IMAGE_PULL_SECRET_NAME`
 - Optional DNS: `DNS_ENABLED`, `PRIVATE_DNS_ZONE_*`
 - TLS (enabled by default; set workflow input `enable_tls=false` to run without TLS):
   - `ELOKO_WILDCARD_CRT` (PEM certificate / full chain)
@@ -86,6 +100,7 @@ Ingress mode is less opinionated; you should enforce:
 - Policy: require `spec.ingressClassName: traefik`, TLS enabled, and restrict hostnames to approved zones.
 
 See: `docs/onboarding-ingress.md`
+
 
 ## TLS enablement (wildcard certificate)
 
@@ -157,6 +172,7 @@ This triggers separate debug jobs that upload:
 
 It also uploads:
 - `values.traefik.generated.yaml` (safe: contains no secrets)
+- `traefik-deploy-debug` (helm chart metadata, helm upgrade log, release manifests, and kubectl snapshot/logs; best-effort, no Secrets exported)
 
 The private key is **never** uploaded.
 
@@ -179,10 +195,56 @@ By default, the dashboard/API is not exposed on the data-plane. For dev-only val
 Manual (operator) check:
 - `kubectl -n traefik port-forward svc/traefik-dashboard 8080:8080` then browse `http://127.0.0.1:8080/dashboard/`
 
-## Azure permissions notes
+## Additional configuration (Azure RBAC)
 
-- **Internal LB provisioning**: AKS managed identity must be able to read subnet/VNet and manage load balancers (you observed `subnets/read` 403 until granting).
-- **Private DNS updates (cross-subscription)**: the deploy SP needs `Private DNS Zone Contributor` (or Contributor) on the target zone or RG.
+This deployment touches **two different identities**. Assign Azure RBAC to the identity that performs the action:
+
+1) **AKS cluster identity** (managed identity recommended)
+   - Used by the AKS cloud provider to provision/maintain Azure Load Balancer resources for Kubernetes `Service` objects of type `LoadBalancer`.
+
+2) **Deployment service principal** (this workflow)
+   - Used for Azure login, fetching AKS credentials, and (optionally) writing Private DNS records.
+
+### Network Contributor (AKS cluster identity)
+
+To provision an **internal** Azure Load Balancer (ILB) onto your target VNet/subnet, the **AKS cluster identity** must have:
+
+- Role: **Network Contributor**
+- Scope: the **subnet** where the ILB is created (preferred), or VNet scope if you cannot scope to subnet.
+
+Example (subnet scope; system-assigned MI):
+
+```bash
+AKS_PRINCIPAL_ID=$(az aks show -g <AKS_RESOURCE_GROUP> -n <AKS_CLUSTER_NAME> --query identity.principalId -o tsv)
+
+az role assignment create \
+  --assignee-object-id "$AKS_PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Network Contributor" \
+  --scope "/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<VNET_RG>/providers/Microsoft.Network/virtualNetworks/<VNET_NAME>/subnets/<SUBNET_NAME>"
+```
+
+If your AKS uses a legacy service principal identity, apply the same role to that SPN object ID instead.
+
+### Private DNS Zone Contributor (deployment service principal; optional)
+
+When `DNS_ENABLED=true`, the workflow creates/updates a Private DNS **A record** using Azure CLI. That operation is performed by the **deployment service principal** (`DEPLOY_CLIENT_ID`/`DEPLOY_SECRET`).
+
+- Role: **Private DNS Zone Contributor**
+- Scope: the Private DNS **zone resource** (preferred) or its resource group
+- Cross-subscription zones are supported, but the role assignment must exist in the subscription that hosts the zone.
+
+Example (zone scope):
+
+```bash
+DEPLOY_SPN_OBJECT_ID=$(az ad sp show --id <DEPLOY_CLIENT_ID> --query id -o tsv)
+
+az role assignment create \
+  --assignee-object-id "$DEPLOY_SPN_OBJECT_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Private DNS Zone Contributor" \
+  --scope "/subscriptions/<DNS_SUBSCRIPTION_ID>/resourceGroups/<DNS_RG>/providers/Microsoft.Network/privateDnsZones/<PRIVATE_DNS_ZONE_NAME>"
+```
 
 ## Next steps
 
